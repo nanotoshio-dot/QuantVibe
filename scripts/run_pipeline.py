@@ -11,6 +11,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from qlib_side.common import venv_python  # noqa: E402
 
+GATE_REJECTED_RC = 20
+
 STEPS = ["prepare", "settle", "train", "export", "execute"]
 MODULES = {
     "prepare": "qlib_side.prepare_data",
@@ -74,8 +76,15 @@ def main() -> int:
     print(f"QuantVibe pipeline | root={PROJECT_ROOT}")
     for step in steps:
         rc = run_step(step, args.config, args.force_demo, args.python)
+        if step == "export" and rc == GATE_REJECTED_RC:
+            print(
+                "\n[VALIDACION] El modelo fue REPROBADO por el gate de investigacion.\n"
+                "[EJECUCION BLOQUEADA] No se publicaron nuevas senales y no se enviaron ordenes."
+            )
+            return GATE_REJECTED_RC
+
         if rc != 0:
-            print(f"\n[ABORTE] el paso '{step}' terminó con código {rc}")
+            print(f"\n[ERROR TECNICO] el paso '{step}' termino con codigo {rc}")
             return rc
     print(
         "\nPipeline terminado.\n"

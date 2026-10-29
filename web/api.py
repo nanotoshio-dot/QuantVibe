@@ -476,9 +476,14 @@ def _run_pipeline_worker(mode: str, steps: Optional[List[str]], config_path: Opt
         pipeline_state["ended_at"] = datetime.now(timezone.utc).isoformat()
 
     if rc == 0:
-        broadcast_log("\n>>> [ÉXITO] Pipeline completado correctamente (código 0).")
+        broadcast_log("\n>>> [EXITO] Pipeline completado correctamente (codigo 0).")
+    elif rc == 20:
+        broadcast_log(
+            "\n>>> [VALIDACION] Modelo REPROBADO por el gate. "
+            "Senales no publicadas y ejecucion bloqueada."
+        )
     else:
-        broadcast_log(f"\n>>> [FALLO] Pipeline abortado con código {rc}.")
+        broadcast_log(f"\n>>> [FALLO TECNICO] Pipeline abortado con codigo {rc}.")
 
 
 @app.post("/api/pipeline/run")

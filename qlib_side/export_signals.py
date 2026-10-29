@@ -43,7 +43,8 @@ def export(config_path: str | None = None, as_of: str | None = None, force: bool
             "       Reentrena con mejores datos/features o publica igualmente con --force.",
             file=sys.stderr,
         )
-        return 1
+        # Reserved exit code: research gate rejected the model.
+        return 20
 
     if as_of is None:
         as_of = str(df["datetime"].max())
