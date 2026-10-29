@@ -1,7 +1,18 @@
 {
   "project": "QuantVibe",
   "region": "us",
-  "universe": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "XOM"],
+  "universe": [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "AMZN",
+    "NVDA",
+    "META",
+    "TSLA",
+    "JPM",
+    "V",
+    "XOM"
+  ],
   "data": {
     "raw_dir": "data/raw",
     "qlib_dir": "data/qlib_data",
@@ -12,9 +23,18 @@
     "model": "lgbm",
     "label": "Ref($close, -2) / Ref($close, -1) - 1",
     "segments": {
-      "train": ["2021-01-04", "2024-06-30"],
-      "valid": ["2024-07-01", "2024-12-31"],
-      "test": ["2025-01-02", "2026-08-21"]
+      "train": [
+        "2021-01-04",
+        "2024-06-30"
+      ],
+      "valid": [
+        "2024-07-01",
+        "2024-12-31"
+      ],
+      "test": [
+        "2025-01-02",
+        "auto"
+      ]
     },
     "handler_kwargs": {
       "instruments": "all"

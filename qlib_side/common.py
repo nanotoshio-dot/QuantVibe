@@ -22,6 +22,13 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
         from datetime import date
 
         data["end"] = date.today().isoformat()
+    training = cfg.get("training", {})
+    segments = training.get("segments", {})
+    test_segment = segments.get("test")
+    if isinstance(test_segment, list) and len(test_segment) == 2:
+        if str(test_segment[1]).lower() == "auto":
+            test_segment[1] = data["end"]
+
     for key in ("raw_dir", "qlib_dir"):
         p = Path(data[key])
         if not p.is_absolute():
