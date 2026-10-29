@@ -77,11 +77,11 @@ def build_plan(
             orders.append(entry)
             continue
 
-        # If fractional or raw_qty < 1.0, use 2 decimal places (CFD lots / fractional shares)
+        # Equity planner: quantity is expressed in shares, never MT5 lots.
         if fractional or raw_qty < 1.0:
             qty = round(raw_qty, 2)
             if qty <= 0:
-                qty = 0.01  # Minimum lot for MT5 / micro-share
+                qty = 0.01  # Minimum fractional share used by this planner
         else:
             qty = int(round(raw_qty))
 
@@ -89,6 +89,7 @@ def build_plan(
             {
                 "status": "PLANNED",
                 "qty": qty,
+                "quantity_unit": "shares",
                 "est_price": price,
                 "est_notional": round(qty * price, 2),
             }
@@ -168,7 +169,7 @@ def main() -> None:
     parser.add_argument("--capital", type=float, default=None, help="Capital total objetivo de la cuenta (ej. 5000, 50000)")
     parser.add_argument("--symbol-suffix", default="", help="Sufijo del broker (ej. .US, .pro, _m)")
     parser.add_argument("--symbol-prefix", default="", help="Prefijo del broker (ej. #)")
-    parser.add_argument("--fractional", action="store_true", default=True, help="Permitir lotes / fracciones fraccionarias")
+    parser.add_argument("--fractional", action="store_true", default=True, help="Permitir acciones fraccionarias")
     parser.add_argument(
         "--submit",
         action="store_true",

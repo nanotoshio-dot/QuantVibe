@@ -215,20 +215,25 @@ def get_status() -> Dict[str, Any]:
     }
 
 
-def ensure_artifacts():
-    """Ensures signals, evaluation, and orders artifacts exist; generates them if missing."""
-    signals_path = ARTIFACTS_DIR / "signals.json"
-    eval_path = ARTIFACTS_DIR / "evaluation.json"
-    orders_path = ARTIFACTS_DIR / "orders_plan.json"
-    if not (signals_path.is_file() and eval_path.is_file() and orders_path.is_file()):
-        try:
-            cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "run_pipeline.py"), "--force-demo"]
-            env = dict(os.environ)
-            env["PYTHONPATH"] = str(PROJECT_ROOT)
-            env["QVB_FORCE_DEMO"] = "1"
-            subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env, check=False)
-        except Exception as e:
-            print(f"Warning: could not auto-generate artifacts: {e}")
+def ensure_artifacts() -> Dict[str, bool]:
+    """Checks required artifacts without generating demo or synthetic data."""
+    required = {
+        "signals": ARTIFACTS_DIR / "signals.json",
+        "evaluation": ARTIFACTS_DIR / "evaluation.json",
+        "orders_plan": ARTIFACTS_DIR / "orders_plan.json",
+    }
+
+    status = {name: path.is_file() for name, path in required.items()}
+    missing = [name for name, exists in status.items() if not exists]
+
+    if missing:
+        print(
+            "[ARTIFACTS] Missing required artifacts: "
+            + ", ".join(missing)
+            + ". Automatic demo generation is disabled."
+        )
+
+    return status
 
 
 @app.on_event("startup")
@@ -238,74 +243,59 @@ def startup_event():
 
 @app.get("/api/signals")
 def get_signals() -> Dict[str, Any]:
-    """Reads artifacts/signals.json, validating integrity and SHA-256 checksum."""
+    """Reads real artifacts/signals.json and validates its checksum."""
     signals_path = ARTIFACTS_DIR / "signals.json"
-    if not signals_path.is_file():
-        ensure_artifacts()
 
     if not signals_path.is_file():
-        # Fallback structured response if disk write failed
-        fallback_data = {
-            "version": "1.0",
-            "published_at": datetime.now(timezone.utc).isoformat(),
-            "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "signals": [
-                {"instrument": "TSLA", "score": 0.128151, "rank": 1},
-                {"instrument": "AAPL", "score": 0.100546, "rank": 2},
-                {"instrument": "META", "score": 0.083558, "rank": 3},
-                {"instrument": "JPM", "score": 0.054135, "rank": 4},
-                {"instrument": "NVDA", "score": 0.047451, "rank": 5}
-            ],
-            "metadata": {"data_source": "Qlib Engine", "model_type": "Alpha158+LGBModel"}
-        }
-        chk = checksum_of(fallback_data)
-        fallback_data["checksum"] = chk
-        return {
-            "verified": True,
-            "checksum": chk,
-            "computed_checksum": chk,
-            "payload": fallback_data
-        }
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "signals.json no encontrado. "
+                "Ejecuta el pipeline real antes de consultar se?ales."
+            ),
+        )
 
     try:
         data = load_signals(signals_path)
         expected_checksum = checksum_of(data)
         file_checksum = data.get("checksum")
-        is_verified = (expected_checksum == file_checksum)
+        is_verified = expected_checksum == file_checksum
+
         return {
             "verified": is_verified,
             "checksum": file_checksum,
             "computed_checksum": expected_checksum,
-            "payload": data
+            "payload": data,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error validando señales: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error validando signals.json: {str(e)}",
+        )
 
 
 @app.get("/api/evaluation")
 def get_evaluation() -> Dict[str, Any]:
-    """Reads artifacts/evaluation.json containing IC, ICIR, and publication gate results."""
+    """Reads the real evaluation artifact. Never returns synthetic metrics."""
     eval_path = ARTIFACTS_DIR / "evaluation.json"
-    if not eval_path.is_file():
-        ensure_artifacts()
 
     if not eval_path.is_file():
-        return {
-            "model_type": "Alpha158+LightGBM",
-            "evaluated_at": datetime.now(timezone.utc).isoformat(),
-            "n_days": 1459,
-            "mean_ic": 0.0681,
-            "icir": 0.2035,
-            "passed": True,
-            "gate_criteria": {"min_mean_ic": 0.015, "min_icir": 0.05},
-            "universe_size": 10
-        }
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "evaluation.json no encontrado. "
+                "Ejecuta la evaluaci?n real antes de consultar m?tricas."
+            ),
+        )
 
     try:
         with open(eval_path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error leyendo evaluation.json: {str(e)}",
+        )
 
 
 @app.get("/api/orders")
@@ -687,12 +677,23 @@ def mt5_status(account: Optional[str] = None):
 
 
 @app.get("/api/mt5/orders")
-def get_mt5_pending_orders(account: str = "default", balance: Optional[float] = None):
-    """Called by MT5 EA / Bridge to poll pending orders to execute."""
+def get_mt5_pending_orders(account: str, balance: Optional[float] = None):
+    """Returns pending MT5 orders for one explicit account only."""
     import time
+
+    account = str(account or "").strip()
+    if not account or account.lower() == "default":
+        raise HTTPException(
+            status_code=400,
+            detail="MT5 polling requiere un account expl?cito; 'default' no est? permitido.",
+        )
+
+    now = time.time()
+
     if account in mt5_bridge_state["sessions"]:
-        mt5_bridge_state["sessions"][account]["last_seen"] = time.time()
-        if balance:
+        mt5_bridge_state["sessions"][account]["last_seen"] = now
+        mt5_bridge_state["sessions"][account]["last_seen_iso"] = datetime.now(timezone.utc).isoformat()
+        if balance is not None:
             mt5_bridge_state["sessions"][account]["balance"] = balance
     else:
         mt5_bridge_state["sessions"][account] = {
@@ -700,17 +701,16 @@ def get_mt5_pending_orders(account: str = "default", balance: Optional[float] = 
             "broker": "MetaTrader 5 Client",
             "server": "Active Terminal",
             "balance": balance or 0.0,
-            "last_seen": time.time(),
-            "last_seen_iso": datetime.now(timezone.utc).isoformat()
+            "last_seen": now,
+            "last_seen_iso": datetime.now(timezone.utc).isoformat(),
         }
 
-    queue = mt5_bridge_state["queues"].get(account, [])
-    default_queue = mt5_bridge_state["queues"].get("default", [])
-    all_orders = queue + default_queue
+    orders = list(mt5_bridge_state["queues"].get(account, []))
 
+    # Consume only this account's queue.
     mt5_bridge_state["queues"][account] = []
-    mt5_bridge_state["queues"]["default"] = []
-    return {"orders": all_orders}
+
+    return {"orders": orders}
 
 
 @app.post("/api/mt5/ack")
@@ -739,28 +739,85 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
     planned_orders = [o for o in plan.get("orders", []) if o.get("status") == "PLANNED"]
 
     bridge_notice = ""
-    if req.broker_id == "mt5" and planned_orders:
-        if account_id not in mt5_bridge_state["queues"]:
-            mt5_bridge_state["queues"][account_id] = []
-        mt5_bridge_state["queues"][account_id] = list(planned_orders)
-        mt5_bridge_state["queues"]["default"] = list(planned_orders)
 
-        # Check if MT5 EA / Bridge is active
-        import time
-        sess = mt5_bridge_state["sessions"].get(account_id) or (
-            list(mt5_bridge_state["sessions"].values())[0] if mt5_bridge_state["sessions"] else None
-        )
-        is_active = sess is not None and (time.time() - sess.get("last_seen", 0)) < 45
-        if is_active:
+    if req.broker_id == "mt5":
+        if req.allow_live:
+            if not planned_orders:
+                raise HTTPException(
+                    status_code=409,
+                    detail="No hay ?rdenes PLANNED disponibles para enviar a MT5.",
+                )
+
+            if not account_id or account_id.lower() == "default":
+                raise HTTPException(
+                    status_code=400,
+                    detail="MT5 live requiere un n?mero de cuenta expl?cito.",
+                )
+
+            invalid_units = [
+                o for o in planned_orders
+                if str(o.get("quantity_unit", "")).lower() != "lots"
+            ]
+
+            if invalid_units:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Plan incompatible con MT5: todas las ?rdenes deben usar "
+                        "quantity_unit='lots'. El planner de acciones genera 'shares' "
+                        "y no puede convertirse a lotes autom?ticamente."
+                    ),
+                )
+
+            import time
+            sess = mt5_bridge_state["sessions"].get(account_id)
+
+            if sess is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"No existe una sesi?n MT5 activa para la cuenta {account_id}. "
+                        "Inicia primero el bridge autenticado para esa cuenta."
+                    ),
+                )
+
+            age = time.time() - sess.get("last_seen", 0)
+            if age >= 45:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"La sesi?n MT5 de la cuenta {account_id} est? inactiva "
+                        f"({age:.1f}s sin heartbeat)."
+                    ),
+                )
+
+            session_account = str(sess.get("account", "")).strip()
+            if session_account != account_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="La identidad de la sesi?n MT5 no coincide con la cuenta solicitada.",
+                )
+
+            # One route only: exact-account bridge queue.
+            mt5_bridge_state["queues"][account_id] = list(planned_orders)
+
             bridge_notice = (
-                f"\n[PUENTE MT5 ACTIVO] {len(planned_orders)} órdenes despachadas al terminal MetaTrader 5 "
-                f"(Cuenta: {sess.get('account')}, Broker: {sess.get('broker')}). Ejecución automática en proceso."
+                f"[PUENTE MT5 ACTIVO] {len(planned_orders)} ?rdenes en cola para "
+                f"la cuenta {account_id}. Ejecuci?n delegada exclusivamente al bridge."
             )
-        else:
-            bridge_notice = (
-                f"\n[PUENTE MT5 EN ESPERA] {len(planned_orders)} órdenes listas en la cola. "
-                "Para ejecución directa en tu MT5, activa el EA QuantVibe_Bridge.mq5 o ejecuta start_mt5_bridge.bat en tu PC."
-            )
+
+            # IMPORTANT:
+            # Do not call execute_signals --submit or broker_mt5.py here.
+            # That would create a second execution route.
+            return {
+                "return_code": 0,
+                "stdout": bridge_notice,
+                "stderr": "",
+                "live_submitted": True,
+                "execution_route": "mt5_bridge",
+                "account": account_id,
+                "queued_orders": len(planned_orders),
+            }
 
     env = dict(os.environ)
 
@@ -811,7 +868,7 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
     if prefix:
         cmd.extend(["--symbol-prefix", prefix])
 
-    if req.allow_live:
+    if req.allow_live and req.broker_id != "mt5":
         if not req.order_cmd_template:
             raise HTTPException(status_code=400, detail="El envío real exige order_cmd_template.")
         template = req.order_cmd_template.strip()

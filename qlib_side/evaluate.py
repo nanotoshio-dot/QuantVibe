@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 ARTIFACTS = Path(__file__).resolve().parents[1] / "artifacts"
-DEFAULT_THRESHOLDS = {"min_days": 60, "min_mean_ic": 0.0, "min_icir": 0.0}
+DEFAULT_THRESHOLDS = {"min_days": 120, "min_mean_ic": 0.01, "min_icir": 0.05}
 
 
 def _spearman(x: np.ndarray, y: np.ndarray) -> float:
