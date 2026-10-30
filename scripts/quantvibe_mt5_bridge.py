@@ -275,8 +275,10 @@ def main():
     print(f"      • Cuenta Login : {account_info.login} ({account_info.currency})")
     print(f"      • Broker / Firm: {account_info.company}")
     print(f"      • Servidor MT5 : {account_info.server}")
-    print(f"      • Balance Real : ${account_info.balance:,.2f} USD")
-    print(f"      • Equidad Libre: ${account_info.equity:,.2f} USD")
+    initial_currency = str(account_info.currency or "USD").upper()
+    initial_cent_divider = 100.0 if initial_currency == "USC" else 1.0
+    print(f"      Balance Real : {account_info.balance:,.2f} {initial_currency} (equiv. ${account_info.balance / initial_cent_divider:,.2f} USD)")
+    print(f"      Equidad Libre: {account_info.equity:,.2f} {initial_currency} (equiv. ${account_info.equity / initial_cent_divider:,.2f} USD)")
     print(f"      • Apalancamiento: 1:{account_info.leverage}")
     print(f"      • Algo Trading : {'ACTIVO (Permitido)' if terminal_info.trade_allowed else 'DESACTIVADO (Activa el botón Algo Trading en MT5)'}")
 
@@ -328,8 +330,17 @@ def main():
                 mt5.shutdown()
                 sys.exit(1)
 
-            balance = float(acc.balance)
-            equity = float(acc.equity)
+            currency = str(acc.currency or "USD").upper()
+            cent_divider = 100.0 if currency == "USC" else 1.0
+            cent_account = cent_divider == 100.0
+
+            balance_raw = float(acc.balance)
+            equity_raw = float(acc.equity)
+            margin_free_raw = float(acc.margin_free)
+
+            balance = balance_raw / cent_divider
+            equity = equity_raw / cent_divider
+            margin_free = margin_free_raw / cent_divider
 
             # 1. Send Heartbeat every 10 seconds
             if now - last_heartbeat > 10:
@@ -337,9 +348,15 @@ def main():
                     "account": account_id,
                     "broker": acc.company if acc else "Unknown",
                     "server": acc.server if acc else "Unknown",
-                    "currency": acc.currency if acc else "USD",
+                    "currency": currency,
                     "balance": balance,
                     "equity": equity,
+                    "margin_free": margin_free,
+                    "balance_raw": balance_raw,
+                    "equity_raw": equity_raw,
+                    "margin_free_raw": margin_free_raw,
+                    "cent_account": cent_account,
+                    "cent_divider": cent_divider,
                     "leverage": acc.leverage if acc else 100,
                     "algo_trading": bool(terminal_info.trade_allowed)
                 }).encode("utf-8")

@@ -66,3 +66,23 @@ ehthumbs.db
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# QuantVibe local/runtime
+.venv/
+artifacts/
+data/qlib_data/
+mlruns/
+*.db
+*.jsonl
+__pycache__/
+.pytest_cache/
+
+# Local backups
+*_before_*.py
+*_before_*.tsx
+*.bak
+
+# Secrets / local environment
+.env
+.env.*
+!.env.example

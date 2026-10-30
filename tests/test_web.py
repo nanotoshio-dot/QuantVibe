@@ -1,4 +1,7 @@
 import unittest
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     from starlette.testclient import TestClient
@@ -106,38 +109,109 @@ class TestWebAPI(unittest.TestCase):
 
 
     def test_recalculate_orders_plan_mt5_vantage(self):
-        res = self.client.post(
-            "/api/orders/recalculate",
-            json={
-                "capital": 5000.0,
-                "symbol_suffix": "",
-                "symbol_prefix": "",
-                "broker_id": "mt5",
-            },
+        def fake_symbol_info(symbol):
+            if symbol == "AMZNUSD":
+                min_lot = 1.0
+                step = 1.0
+                max_lot = 1000.0
+            else:
+                min_lot = 0.1
+                step = 0.1
+                max_lot = 1500.0
+
+            return SimpleNamespace(
+                visible=True,
+                volume_min=min_lot,
+                volume_step=step,
+                volume_max=max_lot,
+                trade_contract_size=1.0,
+            )
+
+        fake_mt5 = SimpleNamespace(
+            ORDER_TYPE_BUY=0,
+            ORDER_TYPE_SELL=1,
+
+            initialize=lambda: True,
+            shutdown=lambda: None,
+            last_error=lambda: (0, "OK"),
+
+            account_info=lambda: SimpleNamespace(
+                currency="USC",
+                margin_free=1_000_000.0,
+            ),
+
+            symbol_info=fake_symbol_info,
+
+            symbol_select=lambda symbol, visible: True,
+
+            symbol_info_tick=lambda symbol: SimpleNamespace(
+                ask=200.0,
+                bid=199.0,
+            ),
+
+            order_calc_margin=lambda order_type, symbol, lot, price: 100.0,
         )
 
+        with patch.dict(
+            sys.modules,
+            {"MetaTrader5": fake_mt5},
+        ):
+            res = self.client.post(
+                "/api/orders/recalculate",
+                json={
+                    "capital": 5000.0,
+                    "symbol_suffix": "",
+                    "symbol_prefix": "",
+                    "broker_id": "mt5",
+                },
+            )
+
         self.assertEqual(res.status_code, 200)
+
         data = res.json()
 
         self.assertEqual(
             data.get("execution_adapter"),
-            "mt5_vantage_stock_cfd_v1",
+            "mt5_vantage_margin_v2",
+        )
+
+        self.assertIn(
+            "mt5_margin",
+            data,
+        )
+
+        self.assertTrue(
+            data["mt5_margin"]["cent_account"]
+        )
+
+        self.assertEqual(
+            data["mt5_margin"]["cent_divider"],
+            100.0,
         )
 
         orders = data.get("orders", [])
+
         self.assertTrue(orders)
 
         for ord_item in orders:
-            if ord_item.get("status") in {"PLANNED", "SKIPPED"}:
+            if ord_item.get("status") in {
+                "PLANNED",
+                "SKIPPED",
+            }:
                 self.assertEqual(
                     ord_item.get("quantity_unit"),
                     "lots",
-                    msg=f"MT5 order leaked non-lot unit: {ord_item}",
+                    msg=(
+                        "MT5 order leaked non-lot unit: "
+                        f"{ord_item}"
+                    ),
                 )
+
                 self.assertNotEqual(
                     ord_item.get("quantity_unit"),
                     "shares",
                 )
+
 
     def test_recalculate_orders_plan_injection_rejected(self):
         # Invalid capital

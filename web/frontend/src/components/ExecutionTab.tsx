@@ -451,11 +451,33 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
     setIsSubmitting(true)
     setSubmitOutput(null)
     try {
+      const effectiveCredentials =
+        selectedBrokerId === 'mt5'
+          ? {
+              ...credentials,
+              account:
+                credentials.account?.trim() ||
+                (mt5Status?.connected && mt5Status.session?.account
+                  ? String(mt5Status.session.account)
+                  : ''),
+            }
+          : credentials
+
+      if (
+        allowLive &&
+        selectedBrokerId === 'mt5' &&
+        !effectiveCredentials.account
+      ) {
+        throw new Error(
+          'MT5 conectado, pero no se pudo identificar el n?mero de cuenta.'
+        )
+      }
+
       const res = await executeOrders(
         allowLive,
         orderCmdTemplate,
         selectedBrokerId,
-        credentials,
+        effectiveCredentials,
         accountCapital,
         symbolSuffix,
         symbolPrefix
@@ -1355,7 +1377,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
             variant={allowLive ? 'danger' : 'primary'}
             size="lg"
             loading={isSubmitting}
-            disabled={isSubmitting || orderList.length === 0}
+            disabled={isSubmitting || !orderList.some((o) => o.status === 'PLANNED')}
             onClick={() => (allowLive ? setShowConfirmModal(true) : handleExecute())}
           >
             {!isSubmitting && <Send className="h-4 w-4" />}
@@ -1407,7 +1429,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
 
       {/* ═══════════════ 7. CONFIRMATION GLASS MODAL ═══════════════ */}
       <AnimatePresence>
-        {showConfirmModal && (
+        {showConfirmModal && orderList.some((o) => o.status === 'PLANNED') && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -1434,8 +1456,11 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
                   ¿Confirmas la transmisión real a {selectedBroker.name}?
                 </h3>
                 <p className="text-xs leading-relaxed text-[#86868B]">
-                  Estás a punto de emitir <span className="text-white font-bold">{orderList.length} órdenes reales</span> con
-                  una exposición calculada de <span className="text-white font-bold">${estimatedTotal.toFixed(2)} USD</span> hacia
+                  Estás a punto de emitir <span className="text-white font-bold">{orderList.filter((o) => o.status === 'PLANNED').length} órdenes reales</span> con
+                  una exposición calculada de <span className="text-white font-bold">${orderList
+                    .filter((o) => o.status === 'PLANNED')
+                    .reduce((sum, o) => sum + o.est_notional, 0)
+                    .toFixed(2)} USD</span> hacia
                   el broker <span className="text-white font-bold">{selectedBroker.name}</span>.
                 </p>
               </div>

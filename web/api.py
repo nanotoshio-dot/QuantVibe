@@ -609,88 +609,293 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
         )
 
         # MT5/Vantage adapter:
-        # Qlib plans equity quantities as shares. Vantage stock CFDs in this
-        # account use contract_size=1, so shares -> lots is numerically 1:1,
-        # but the broker volume_min / volume_step must still be respected.
+        # For MT5 we size using REAL broker margin requirements instead of
+        # pretending that account capital is cash notional for stock shares.
         if (req.broker_id or "").lower() == "mt5":
-            import math
+            import MetaTrader5 as mt5
 
-            vantage_specs = {
-                "AAPL":  {"symbol": "AAPL",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "MSFT":  {"symbol": "MSFT",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "GOOGL": {"symbol": "GOOGL.24H", "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "NVDA":  {"symbol": "NVIDIA",    "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "META":  {"symbol": "META",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "AMZN":  {"symbol": "AMZNUSD",   "contract": 1.0, "min": 1.0, "step": 1.0, "max": 1000.0},
-                "TSLA":  {"symbol": "TSLA",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "JPM":   {"symbol": "JPM",       "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "XOM":   {"symbol": "XOM.24H",   "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-                "V":     {"symbol": "VISA",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
-            }
-
-            for order in updated_plan.get("orders", []):
-                if order.get("status") != "PLANNED":
-                    continue
-
-                instrument = str(order.get("instrument", "")).upper().strip()
-                spec = vantage_specs.get(instrument)
-
-                if spec is None:
-                    order.update(
-                        status="SKIPPED",
-                        reason="mt5_symbol_mapping_missing",
-                        quantity_unit="lots",
-                    )
-                    continue
-
-                shares = float(order.get("qty") or 0.0)
-                contract = spec["contract"]
-                raw_lots = shares / contract
-                step = spec["step"]
-
-                # Always round DOWN: never increase risk just to satisfy broker step.
-                lots = math.floor((raw_lots + 1e-12) / step) * step
-                decimals = 0 if step >= 1 else 1
-                lots = round(lots, decimals)
-
-                if lots < spec["min"]:
-                    order.update(
-                        status="SKIPPED",
-                        broker_symbol=spec["symbol"],
-                        source_qty_shares=shares,
-                        quantity_unit="lots",
-                        reason=f"below_mt5_min_volume:{spec['min']}",
-                        qty=0,
-                    )
-                    continue
-
-                if lots > spec["max"]:
-                    order.update(
-                        status="SKIPPED",
-                        broker_symbol=spec["symbol"],
-                        source_qty_shares=shares,
-                        quantity_unit="lots",
-                        reason=f"above_mt5_max_volume:{spec['max']}",
-                        qty=0,
-                    )
-                    continue
-
-                price = float(order.get("est_price") or 0.0)
-
-                order.update(
-                    broker_symbol=spec["symbol"],
-                    source_qty_shares=shares,
-                    qty=lots,
-                    quantity_unit="lots",
-                    mt5_contract_size=contract,
-                    mt5_volume_min=spec["min"],
-                    mt5_volume_step=step,
-                    mt5_volume_max=spec["max"],
-                    est_notional=round(lots * contract * price, 2),
+            if not mt5.initialize():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"No se pudo conectar al terminal MT5: {mt5.last_error()}",
                 )
 
-            updated_plan["execution_adapter"] = "mt5_vantage_stock_cfd_v1"
+            try:
+                account = mt5.account_info()
+                if account is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="MT5 no tiene una cuenta activa.",
+                    )
 
+                currency = str(account.currency or "").upper()
+
+                # Vantage CENT account:
+                # 3792.91 USC == approximately 37.9291 USD economic value.
+                cent_divider = 100.0 if currency == "USC" else 1.0
+
+                margin_free_raw = float(account.margin_free or 0.0)
+                margin_free_economic = margin_free_raw / cent_divider
+
+                requested_capital = float(req.capital)
+
+                tolerance = max(
+                    0.05,
+                    margin_free_economic * 0.01,
+                )
+
+                if requested_capital > margin_free_economic + tolerance:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Capital solicitado {requested_capital:.2f} excede "
+                            f"el margen libre real de MT5 "
+                            f"({margin_free_economic:.2f} USD equivalentes)."
+                        ),
+                    )
+
+                margin_budget_raw = requested_capital * cent_divider
+                remaining_margin_raw = min(
+                    margin_budget_raw,
+                    margin_free_raw,
+                )
+
+                symbol_map = {
+                    "AAPL": "AAPL",
+                    "MSFT": "MSFT",
+                    "GOOGL": "GOOGL.24H",
+                    "NVDA": "NVIDIA",
+                    "META": "META",
+                    "AMZN": "AMZNUSD",
+                    "TSLA": "TSLA",
+                    "JPM": "JPM",
+                    "XOM": "XOM.24H",
+                    "V": "VISA",
+                }
+
+                for order in updated_plan.get("orders", []):
+                    if order.get("status") != "PLANNED":
+                        continue
+
+                    instrument = str(
+                        order.get("instrument", "")
+                    ).upper().strip()
+
+                    broker_symbol = symbol_map.get(instrument)
+
+                    if not broker_symbol:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            quantity_unit="lots",
+                            reason="mt5_symbol_mapping_missing",
+                        )
+                        continue
+
+                    info = mt5.symbol_info(broker_symbol)
+
+                    if info is None:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            reason="mt5_symbol_not_found",
+                        )
+                        continue
+
+                    if not info.visible:
+                        mt5.symbol_select(broker_symbol, True)
+
+                    tick = mt5.symbol_info_tick(broker_symbol)
+
+                    action = str(
+                        order.get("action", "BUY")
+                    ).upper()
+
+                    if tick is None:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            reason="mt5_tick_unavailable",
+                        )
+                        continue
+
+                    price = (
+                        float(tick.ask)
+                        if action == "BUY"
+                        else float(tick.bid)
+                    )
+
+                    if price <= 0:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            reason="mt5_market_price_unavailable",
+                        )
+                        continue
+
+                    min_lot = float(info.volume_min)
+                    max_lot = float(info.volume_max)
+                    step = float(info.volume_step)
+                    contract = float(info.trade_contract_size)
+
+                    order_type = (
+                        mt5.ORDER_TYPE_BUY
+                        if action == "BUY"
+                        else mt5.ORDER_TYPE_SELL
+                    )
+
+                    required_margin_raw = mt5.order_calc_margin(
+                        order_type,
+                        broker_symbol,
+                        min_lot,
+                        price,
+                    )
+
+                    if required_margin_raw is None:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            reason="mt5_margin_calculation_failed",
+                        )
+                        continue
+
+                    required_margin_raw = float(
+                        required_margin_raw
+                    )
+
+                    required_margin_economic = (
+                        required_margin_raw / cent_divider
+                    )
+
+                    if (
+                        required_margin_raw
+                        > remaining_margin_raw + 1e-9
+                    ):
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            mt5_contract_size=contract,
+                            mt5_volume_min=min_lot,
+                            mt5_volume_step=step,
+                            mt5_volume_max=max_lot,
+                            mt5_margin_required=round(
+                                required_margin_raw, 2
+                            ),
+                            mt5_margin_required_economic=round(
+                                required_margin_economic, 4
+                            ),
+                            reason=(
+                                "insufficient_mt5_margin_for_min_lot"
+                            ),
+                        )
+                        continue
+
+                    # Conservative first implementation:
+                    # execute only the broker's minimum valid lot.
+                    remaining_margin_raw -= required_margin_raw
+
+                    order.update(
+                        status="PLANNED",
+                        broker_symbol=broker_symbol,
+                        qty=min_lot,
+                        quantity_unit="lots",
+                        source_qty_shares=order.get("qty"),
+                        mt5_contract_size=contract,
+                        mt5_volume_min=min_lot,
+                        mt5_volume_step=step,
+                        mt5_volume_max=max_lot,
+                        mt5_margin_required=round(
+                            required_margin_raw, 2
+                        ),
+                        mt5_margin_required_economic=round(
+                            required_margin_economic, 4
+                        ),
+                        est_price=round(price, 4),
+                        est_notional=round(
+                            min_lot * contract * price,
+                            2,
+                        ),
+                    )
+
+                planned = [
+                    o
+                    for o in updated_plan.get("orders", [])
+                    if o.get("status") == "PLANNED"
+                ]
+
+                skipped = [
+                    o
+                    for o in updated_plan.get("orders", [])
+                    if o.get("status") == "SKIPPED"
+                ]
+
+                total_margin_raw = sum(
+                    float(
+                        o.get("mt5_margin_required") or 0.0
+                    )
+                    for o in planned
+                )
+
+                total_exposure = sum(
+                    float(o.get("est_notional") or 0.0)
+                    for o in planned
+                )
+
+                totals = updated_plan.setdefault(
+                    "totals", {}
+                )
+
+                totals["planned_orders"] = len(planned)
+                totals["skipped_orders"] = len(skipped)
+                totals["estimated_exposure"] = round(
+                    total_exposure, 2
+                )
+
+                updated_plan["mt5_margin"] = {
+                    "account_currency": currency,
+                    "cent_account": cent_divider == 100.0,
+                    "cent_divider": cent_divider,
+                    "margin_free_raw": round(
+                        margin_free_raw, 2
+                    ),
+                    "margin_free_economic": round(
+                        margin_free_economic, 4
+                    ),
+                    "requested_capital_economic": round(
+                        requested_capital, 4
+                    ),
+                    "required_margin_raw": round(
+                        total_margin_raw, 2
+                    ),
+                    "required_margin_economic": round(
+                        total_margin_raw / cent_divider,
+                        4
+                    ),
+                    "remaining_margin_economic": round(
+                        remaining_margin_raw / cent_divider,
+                        4
+                    ),
+                }
+
+                updated_plan[
+                    "execution_adapter"
+                ] = "mt5_vantage_margin_v2"
+
+            finally:
+                mt5.shutdown()
+
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Fallo al recalcular plan: {exc}")
 
@@ -834,7 +1039,7 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
         # Never run vibe_side.execute_signals here because that rebuilds
         # orders_plan.json in equity "shares" and destroys the MT5 lot adapter.
         if not req.allow_live:
-            if plan.get("execution_adapter") != "mt5_vantage_stock_cfd_v1":
+            if plan.get("execution_adapter") != "mt5_vantage_margin_v2":
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -966,12 +1171,12 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
                 )
 
             # MT5 plans must have passed through our explicit Vantage adapter.
-            if plan.get("execution_adapter") != "mt5_vantage_stock_cfd_v1":
+            if plan.get("execution_adapter") != "mt5_vantage_margin_v2":
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         "MT5 live bloqueado: el plan no fue convertido por "
-                        "mt5_vantage_stock_cfd_v1. Recalcula lotes primero."
+                        "mt5_vantage_margin_v2. Recalcula lotes primero."
                     ),
                 )
 
@@ -1079,6 +1284,36 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
                 raise HTTPException(
                     status_code=409,
                     detail="La identidad de la sesi?n MT5 no coincide con la cuenta solicitada.",
+                )
+
+            # LIVE SAFETY: the requested account capital may be lower than
+            # the real MT5 balance, but it must never exceed it.
+            # This prevents a user-entered notional amount from impersonating
+            # actual account equity.
+            session_balance = float(sess.get("balance") or 0.0)
+
+            if session_balance <= 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado: el bridge no reporta "
+                        "un balance real valido."
+                    ),
+                )
+
+            balance_tolerance = max(
+                0.05,
+                session_balance * 0.01,
+            )
+
+            if requested_capital > session_balance + balance_tolerance:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado: account_capital "
+                        f"{requested_capital:.2f} excede el balance real "
+                        f"reportado por MT5 ({session_balance:.2f})."
+                    ),
                 )
 
             # One route only: exact-account bridge queue.
