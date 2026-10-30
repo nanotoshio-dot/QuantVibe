@@ -607,6 +607,90 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
             symbol_prefix=prefix,
             fractional=True,
         )
+
+        # MT5/Vantage adapter:
+        # Qlib plans equity quantities as shares. Vantage stock CFDs in this
+        # account use contract_size=1, so shares -> lots is numerically 1:1,
+        # but the broker volume_min / volume_step must still be respected.
+        if (req.broker_id or "").lower() == "mt5":
+            import math
+
+            vantage_specs = {
+                "AAPL":  {"symbol": "AAPL",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "MSFT":  {"symbol": "MSFT",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "GOOGL": {"symbol": "GOOGL.24H", "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "NVDA":  {"symbol": "NVIDIA",    "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "META":  {"symbol": "META",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "AMZN":  {"symbol": "AMZNUSD",   "contract": 1.0, "min": 1.0, "step": 1.0, "max": 1000.0},
+                "TSLA":  {"symbol": "TSLA",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "JPM":   {"symbol": "JPM",       "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "XOM":   {"symbol": "XOM.24H",   "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+                "V":     {"symbol": "VISA",      "contract": 1.0, "min": 0.1, "step": 0.1, "max": 1500.0},
+            }
+
+            for order in updated_plan.get("orders", []):
+                if order.get("status") != "PLANNED":
+                    continue
+
+                instrument = str(order.get("instrument", "")).upper().strip()
+                spec = vantage_specs.get(instrument)
+
+                if spec is None:
+                    order.update(
+                        status="SKIPPED",
+                        reason="mt5_symbol_mapping_missing",
+                        quantity_unit="lots",
+                    )
+                    continue
+
+                shares = float(order.get("qty") or 0.0)
+                contract = spec["contract"]
+                raw_lots = shares / contract
+                step = spec["step"]
+
+                # Always round DOWN: never increase risk just to satisfy broker step.
+                lots = math.floor((raw_lots + 1e-12) / step) * step
+                decimals = 0 if step >= 1 else 1
+                lots = round(lots, decimals)
+
+                if lots < spec["min"]:
+                    order.update(
+                        status="SKIPPED",
+                        broker_symbol=spec["symbol"],
+                        source_qty_shares=shares,
+                        quantity_unit="lots",
+                        reason=f"below_mt5_min_volume:{spec['min']}",
+                        qty=0,
+                    )
+                    continue
+
+                if lots > spec["max"]:
+                    order.update(
+                        status="SKIPPED",
+                        broker_symbol=spec["symbol"],
+                        source_qty_shares=shares,
+                        quantity_unit="lots",
+                        reason=f"above_mt5_max_volume:{spec['max']}",
+                        qty=0,
+                    )
+                    continue
+
+                price = float(order.get("est_price") or 0.0)
+
+                order.update(
+                    broker_symbol=spec["symbol"],
+                    source_qty_shares=shares,
+                    qty=lots,
+                    quantity_unit="lots",
+                    mt5_contract_size=contract,
+                    mt5_volume_min=spec["min"],
+                    mt5_volume_step=step,
+                    mt5_volume_max=spec["max"],
+                    est_notional=round(lots * contract * price, 2),
+                )
+
+            updated_plan["execution_adapter"] = "mt5_vantage_stock_cfd_v1"
+
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Fallo al recalcular plan: {exc}")
 
@@ -746,7 +830,201 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
     bridge_notice = ""
 
     if req.broker_id == "mt5":
+        # MT5 PAPER must simulate the ALREADY RECALCULATED execution plan.
+        # Never run vibe_side.execute_signals here because that rebuilds
+        # orders_plan.json in equity "shares" and destroys the MT5 lot adapter.
+        if not req.allow_live:
+            if plan.get("execution_adapter") != "mt5_vantage_stock_cfd_v1":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 paper requiere un plan adaptado a lotes. "
+                        "Usa 'Recalcular Lotes' primero."
+                    ),
+                )
+
+            invalid_units = [
+                o for o in planned_orders
+                if str(o.get("quantity_unit", "")).lower() != "lots"
+            ]
+            if invalid_units:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MT5 paper bloqueado: hay ?rdenes PLANNED que no usan quantity_unit='lots'.",
+                )
+
+            skipped_orders = [
+                o for o in plan.get("orders", [])
+                if o.get("status") == "SKIPPED"
+            ]
+
+            return {
+                "return_code": 0,
+                "stdout": (
+                    "[PAPER SIMULATION - MT5 BRIDGE]\n"
+                    f"{len(planned_orders)} ?rdenes PLANNED / "
+                    f"{len(skipped_orders)} SKIPPED.\n"
+                    "No se enviaron ?rdenes y orders_plan.json no fue modificado."
+                ),
+                "stderr": "",
+                "live_submitted": False,
+                "execution_route": "mt5_bridge_paper",
+                "queued_orders": 0,
+                "planned_orders": len(planned_orders),
+                "skipped_orders": len(skipped_orders),
+            }
+
         if req.allow_live:
+            # LIVE SAFETY CONTRACT:
+            # Never trust an orders_plan.json only because it exists.
+            # It must come from current real Qlib signals, pass the hard
+            # research gate, match the current signals checksum, be freshly
+            # recalculated for this account capital and already adapted to MT5.
+
+            evaluation_path = ARTIFACTS_DIR / "evaluation.json"
+            signals_path = ARTIFACTS_DIR / "signals.json"
+
+            if not evaluation_path.is_file() or not signals_path.is_file():
+                raise HTTPException(
+                    status_code=409,
+                    detail="MT5 live bloqueado: faltan evaluation.json o signals.json actuales.",
+                )
+
+            with open(evaluation_path, "r", encoding="utf-8") as fh:
+                evaluation = json.load(fh)
+
+            with open(signals_path, "r", encoding="utf-8") as fh:
+                current_signals = json.load(fh)
+
+            # Enforce the production gate independently of any old thresholds
+            # stored inside evaluation.json.
+            n_days = int(evaluation.get("n_days") or 0)
+            mean_ic = float(evaluation.get("mean_ic") or 0.0)
+            icir = float(evaluation.get("icir") or 0.0)
+            gate_passed = bool(evaluation.get("passed"))
+
+            if (
+                not gate_passed
+                or n_days < 120
+                or mean_ic < 0.01
+                or icir < 0.05
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado por research gate: "
+                        f"passed={gate_passed}, n_days={n_days}, "
+                        f"mean_ic={mean_ic:.6f}, icir={icir:.6f}. "
+                        "Requerido: n_days>=120, mean_ic>=0.01, icir>=0.05."
+                    ),
+                )
+
+            # Only real Qlib research output may become live orders.
+            plan_source = str(plan.get("data_source") or "").lower().strip()
+            plan_model = str(plan.get("source_model") or "").lower().strip()
+
+            if plan_source != "qlib" or plan_model.startswith("demo"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado: el plan no proviene de una "
+                        "ejecuci?n Qlib real aprobada."
+                    ),
+                )
+
+            signals_source = str(
+                current_signals.get("metadata", {}).get("data_source")
+                or current_signals.get("data_source")
+                or ""
+            ).lower().strip()
+
+            signals_model = str(
+                current_signals.get("source_model") or ""
+            ).lower().strip()
+
+            if signals_source != "qlib" or signals_model.startswith("demo"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="MT5 live bloqueado: signals.json es demo/synthetic.",
+                )
+
+            # Plan and current signals must belong to the exact same signal set.
+            plan_checksum = str(plan.get("signals_checksum") or "").strip()
+            signals_checksum = str(current_signals.get("checksum") or "").strip()
+
+            if (
+                not plan_checksum
+                or not signals_checksum
+                or plan_checksum != signals_checksum
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado: orders_plan.json no corresponde "
+                        "al signals.json actual (checksum distinto)."
+                    ),
+                )
+
+            # MT5 plans must have passed through our explicit Vantage adapter.
+            if plan.get("execution_adapter") != "mt5_vantage_stock_cfd_v1":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado: el plan no fue convertido por "
+                        "mt5_vantage_stock_cfd_v1. Recalcula lotes primero."
+                    ),
+                )
+
+            # Require explicit capital and reject a stale plan created for
+            # another account size.
+            if req.account_capital is None or float(req.account_capital) <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="MT5 live requiere account_capital expl?cito.",
+                )
+
+            requested_capital = float(req.account_capital)
+            plan_capital = float(plan.get("total_notional_target") or 0.0)
+            capital_tolerance = max(0.02, requested_capital * 0.001)
+
+            if abs(plan_capital - requested_capital) > capital_tolerance:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado: el plan fue calculado para "
+                        f"{plan_capital:.2f}, pero la cuenta solicita "
+                        f"{requested_capital:.2f}. Recalcula lotes."
+                    ),
+                )
+
+            # A live plan must also be recent. Recalculation renews generated_at.
+            try:
+                generated_raw = str(plan.get("generated_at") or "")
+                generated_dt = datetime.fromisoformat(
+                    generated_raw.replace("Z", "+00:00")
+                )
+                if generated_dt.tzinfo is None:
+                    generated_dt = generated_dt.replace(tzinfo=timezone.utc)
+
+                plan_age = (
+                    datetime.now(timezone.utc)
+                    - generated_dt.astimezone(timezone.utc)
+                ).total_seconds()
+            except Exception:
+                raise HTTPException(
+                    status_code=409,
+                    detail="MT5 live bloqueado: generated_at del plan es inv?lido.",
+                )
+
+            if plan_age < -300 or plan_age > 1800:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "MT5 live bloqueado: orders_plan.json est? vencido "
+                        f"({plan_age:.0f}s). Recalcula lotes."
+                    ),
+                )
+
             if not planned_orders:
                 raise HTTPException(
                     status_code=409,

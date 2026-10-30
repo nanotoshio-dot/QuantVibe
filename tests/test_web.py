@@ -90,7 +90,12 @@ class TestWebAPI(unittest.TestCase):
     def test_recalculate_orders_plan(self):
         res = self.client.post(
             "/api/orders/recalculate",
-            json={"capital": 5000.0, "symbol_suffix": ".US", "symbol_prefix": ""}
+            json={
+                "capital": 5000.0,
+                "symbol_suffix": ".US",
+                "symbol_prefix": "",
+                "broker_id": "alpaca",
+            }
         )
         if res.status_code == 200:
             data = res.json()
@@ -98,6 +103,41 @@ class TestWebAPI(unittest.TestCase):
             for ord_item in data["orders"]:
                 if ord_item["status"] == "PLANNED":
                     self.assertTrue(ord_item["broker_symbol"].endswith(".US"))
+
+
+    def test_recalculate_orders_plan_mt5_vantage(self):
+        res = self.client.post(
+            "/api/orders/recalculate",
+            json={
+                "capital": 5000.0,
+                "symbol_suffix": "",
+                "symbol_prefix": "",
+                "broker_id": "mt5",
+            },
+        )
+
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+
+        self.assertEqual(
+            data.get("execution_adapter"),
+            "mt5_vantage_stock_cfd_v1",
+        )
+
+        orders = data.get("orders", [])
+        self.assertTrue(orders)
+
+        for ord_item in orders:
+            if ord_item.get("status") in {"PLANNED", "SKIPPED"}:
+                self.assertEqual(
+                    ord_item.get("quantity_unit"),
+                    "lots",
+                    msg=f"MT5 order leaked non-lot unit: {ord_item}",
+                )
+                self.assertNotEqual(
+                    ord_item.get("quantity_unit"),
+                    "shares",
+                )
 
     def test_recalculate_orders_plan_injection_rejected(self):
         # Invalid capital

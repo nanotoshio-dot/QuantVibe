@@ -436,7 +436,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
         cap ?? accountCapital,
         suf ?? symbolSuffix,
         pre ?? symbolPrefix,
-        selectedBrokerId
+        selectedBroker.id
       )
       onRefresh()
     } catch (err) {
@@ -1264,7 +1264,10 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
             </p>
           </div>
           <span className="font-mono text-xs uppercase tracking-wider text-[#A1A1A6] bg-white/[0.04] px-3 py-1 rounded-full border border-white/[0.07]">
-            {orderList.length} Posiciones Staged
+            {orderList.filter((o) => o.status === 'PLANNED').length} Posiciones Staged
+            {orderList.some((o) => o.status === 'SKIPPED') && (
+              <> ? {orderList.filter((o) => o.status === 'SKIPPED').length} Skipped</>
+            )}
           </span>
         </div>
 
