@@ -115,7 +115,7 @@ def write_evaluation_report(report: Dict[str, Any]) -> Path:
 
 def format_report(report: Dict[str, Any]) -> str:
     lines = [
-        "EvaluaciÃ³n del modelo (gate de backtest):",
+        "Evaluacion del modelo (gate de backtest):",
         f"  dias evaluados      : {report['n_days']} (horizonte {report['fwd_horizon']}d)",
         f"  IC medio            : {report['mean_ic']:+.4f}",
         f"  ICIR                : {report['icir']:+.4f}",
