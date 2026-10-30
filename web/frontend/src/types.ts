@@ -82,6 +82,10 @@ export interface OrderItem {
   qty: number
   est_price: number
   est_notional: number
+  quantity_unit?: string
+  reason?: string
+  mt5_margin_required?: number
+  mt5_margin_required_economic?: number
 }
 
 export interface OrdersPlan {
@@ -98,6 +102,18 @@ export interface OrdersPlan {
     planned_orders: number
     skipped_orders: number
     estimated_exposure: number
+  }
+  execution_adapter?: string
+  mt5_margin?: {
+    account_currency: string
+    cent_account: boolean
+    cent_divider: number
+    margin_free_raw: number
+    margin_free_economic: number
+    requested_capital_economic: number
+    required_margin_raw: number
+    required_margin_economic: number
+    remaining_margin_economic: number
   }
 }
 
