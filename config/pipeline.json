@@ -20,7 +20,7 @@
     "end": "auto"
   },
   "training": {
-    "model": "lgbm",
+    "model": "linear",
     "label": "Ref($close, -2) / Ref($close, -1) - 1",
     "segments": {
       "train": [
@@ -49,9 +49,19 @@
       "max_depth": 6,
       "num_leaves": 32,
       "min_data_in_leaf": 20,
-      "num_threads": 4
+      "num_threads": 4,
+      "seed": 42,
+      "feature_fraction_seed": 42,
+      "bagging_seed": 42,
+      "data_random_seed": 42,
+      "deterministic": true,
+      "force_col_wise": true
     },
-    "momentum_window": 20
+    "momentum_window": 20,
+    "linear_kwargs": {
+      "estimator": "ridge",
+      "alpha": 0.05
+    }
   },
   "signals": {
     "top_k": 5,

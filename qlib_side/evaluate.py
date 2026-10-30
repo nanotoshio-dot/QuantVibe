@@ -31,8 +31,8 @@ def ic_metrics(scores_wide: pd.DataFrame, fwd_wide: pd.DataFrame, top_k: int) ->
     topk_means: list[float] = []
     univ_means: list[float] = []
     for t in common:
-        row_s = s.loc[t].dropna()
-        row_f = f.loc[t].reindex(row_s.index).dropna()
+        row_s = s.loc[t].replace([np.inf, -np.inf], np.nan).dropna()
+        row_f = f.loc[t].reindex(row_s.index).replace([np.inf, -np.inf], np.nan).dropna()
         row_s = row_s.reindex(row_f.index)
         if len(row_s) < 4:
             continue
@@ -54,7 +54,7 @@ def ic_metrics(scores_wide: pd.DataFrame, fwd_wide: pd.DataFrame, top_k: int) ->
         "n_days": n_days,
         "mean_ic": mean_ic,
         "icir": icir,
-        "hit_rate_topk": (topk_hits / n_days) if n_days else float("nan"),
+        "hit_rate_topk": (topk_hits / len(topk_means)) if topk_means else float("nan"),
         "avg_topk_fwd_return": float(np.mean(topk_means)) if topk_means else float("nan"),
         "avg_universe_fwd_return": float(np.mean(univ_means)) if univ_means else float("nan"),
     }
@@ -115,7 +115,7 @@ def write_evaluation_report(report: Dict[str, Any]) -> Path:
 
 def format_report(report: Dict[str, Any]) -> str:
     lines = [
-        "Evaluación del modelo (gate de backtest):",
+        "EvaluaciÃ³n del modelo (gate de backtest):",
         f"  dias evaluados      : {report['n_days']} (horizonte {report['fwd_horizon']}d)",
         f"  IC medio            : {report['mean_ic']:+.4f}",
         f"  ICIR                : {report['icir']:+.4f}",
