@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+﻿import React, { useState, useEffect, useRef } from 'react'
 import confetti from 'canvas-confetti'
 import {
   Play,
@@ -19,10 +19,10 @@ interface PipelineTabProps {
 
 const ALL_STEPS = [
   { id: 'prepare', label: '1. Ingesta (prepare)', desc: 'Descarga y preprocesamiento de datos' },
-  { id: 'settle', label: '2. Liquidación (settle)', desc: 'Auditoría en SQLite de retornos pasados' },
+  { id: 'settle', label: '2. LiquidaciÃ³n (settle)', desc: 'AuditorÃ­a en SQLite de retornos pasados' },
   { id: 'train', label: '3. Entrenamiento (train)', desc: 'Modelo LightGBM sobre Alpha158' },
-  { id: 'export', label: '4. Evaluación (export)', desc: 'Control de Gate IC/ICIR y firma SHA-256' },
-  { id: 'execute', label: '5. Plan (execute)', desc: 'Construcción del plan de órdenes equal-weight' },
+  { id: 'export', label: '4. EvaluaciÃ³n (export)', desc: 'Control de Gate IC/ICIR y firma SHA-256' },
+  { id: 'execute', label: '5. Plan (execute)', desc: 'ConstrucciÃ³n del plan de Ã³rdenes equal-weight' },
 ]
 
 export const PipelineTab: React.FC<PipelineTabProps> = ({
@@ -94,9 +94,8 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
         const res = await fetch(`${getApiBase()}/pipeline/logs`)
         if (res.ok) {
           const data = await res.json()
-          if (data.logs && Array.isArray(data.logs)) {
-            setLogs((prev) => (data.logs.length > prev.length ? data.logs : prev))
-          }
+          // SSE is the single source of truth for live log lines.
+          // Polling only reconciles pipeline running state.
           if (data.is_running === false) {
             setIsRunning(false)
             onPipelineFinished()
@@ -153,7 +152,7 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
 
   const handleRunPipeline = async () => {
     if (selectedSteps.length === 0) {
-      setErrorMsg('Debes seleccionar al menos una fase activa del pipeline para iniciar el cómputo.')
+      setErrorMsg('Debes seleccionar al menos una fase activa del pipeline para iniciar el cÃ³mputo.')
       setTimeout(() => setErrorMsg(null), 5000)
       return
     }
@@ -199,15 +198,15 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
           <Eyebrow>
             <span className="flex items-center gap-2">
               <StatusDot tone={isRunning ? 'pos' : 'muted'} ping={isRunning} />
-              Consola de factores · ciclo cerrado
+              Consola de factores Â· ciclo cerrado
             </span>
           </Eyebrow>
           <h1 className="mt-3 font-sans text-4xl font-extrabold tracking-[-0.035em] text-white sm:text-5xl">
             Centro de mando del <span className="text-[#86868B] font-semibold">pipeline.</span>
           </h1>
           <p className="editorial-subhead mt-3 max-w-xl text-sm leading-relaxed text-[#86868B]">
-            Ingesta → modelado ML → evaluación y firma criptográfica. La telemetría fluye en tiempo
-            real vía SSE con respaldo de polling resistente a proxies.
+            Ingesta â†’ modelado ML â†’ evaluaciÃ³n y firma criptogrÃ¡fica. La telemetrÃ­a fluye en tiempo
+            real vÃ­a SSE con respaldo de polling resistente a proxies.
           </p>
         </div>
 
@@ -222,11 +221,11 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
         />
       </div>
 
-      {/* 2. Phase selector — hairline matrix rail (toggle cells) */}
+      {/* 2. Phase selector â€” hairline matrix rail (toggle cells) */}
       <div>
         <div className="mb-3 flex items-center justify-between">
           <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-[#86868B]">
-            Fases activas · {selectedSteps.length}/{ALL_STEPS.length}
+            Fases activas Â· {selectedSteps.length}/{ALL_STEPS.length}
           </span>
           <span className="font-mono text-[10px] text-[#48484A]">click para alternar</span>
         </div>
@@ -291,12 +290,12 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
       <div className="flex flex-col items-start justify-between gap-4 border-y border-white/[0.07] py-5 sm:flex-row sm:items-center">
         <span className="font-mono text-[11px] text-[#636366]">
           {isRunning
-            ? 'ejecutando en subproceso asíncrono con captura continua…'
-            : 'parámetros configurados · la telemetría fluirá abajo en tiempo real'}
+            ? 'ejecutando en subproceso asÃ­ncrono con captura continuaâ€¦'
+            : 'parÃ¡metros configurados Â· la telemetrÃ­a fluirÃ¡ abajo en tiempo real'}
         </span>
         <Btn size="lg" loading={isRunning} disabled={isRunning} onClick={handleRunPipeline}>
           {!isRunning && <Play className="h-4 w-4 fill-current" />}
-          <span>{isRunning ? 'Ejecutando pipeline…' : 'Lanzar pipeline completo'}</span>
+          <span>{isRunning ? 'Ejecutando pipelineâ€¦' : 'Lanzar pipeline completo'}</span>
         </Btn>
       </div>
 
@@ -317,7 +316,7 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
               {isRunning ? 'Live' : 'Idle'}
             </span>
             <TermIcon className="h-4 w-4 text-[#F5F5F7]" />
-            <span>pipeline.stream · {logs.length} líneas</span>
+            <span>pipeline.stream Â· {logs.length} lÃ­neas</span>
           </div>
 
           <div className="flex items-center gap-2.5">
@@ -325,7 +324,7 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#636366]" />
               <input
                 type="text"
-                placeholder="Buscar en consola…"
+                placeholder="Buscar en consolaâ€¦"
                 value={searchLog}
                 onChange={(e) => setSearchLog(e.target.value)}
                 aria-label="Buscar en los logs"
@@ -369,13 +368,13 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
             <div className="select-none py-16 text-center">
               <TermIcon className="mx-auto mb-2 h-8 w-8 text-[#2C2C2E]" />
               <span className="font-sans text-sm text-[#636366]">
-                Esperando ejecución. Presiona «Lanzar pipeline completo» para ver la telemetría en
+                Esperando ejecuciÃ³n. Presiona Â«Lanzar pipeline completoÂ» para ver la telemetrÃ­a en
                 vivo.
               </span>
             </div>
           ) : (
             filteredLogs.map((line, idx) => {
-              const isSuccess = line.includes('[ÉXITO]') || line.includes('código 0') || line.includes('PASSED')
+              const isSuccess = line.includes('[Ã‰XITO]') || line.includes('cÃ³digo 0') || line.includes('PASSED')
               const isError = line.includes('[ABORTE]') || line.includes('FAIL') || line.includes('ERROR')
               const isHeader = line.includes('=== [') || line.includes('>>>')
               const isGuard = line.includes('[GUARDIA]')
@@ -411,3 +410,4 @@ export const PipelineTab: React.FC<PipelineTabProps> = ({
     </div>
   )
 }
+
