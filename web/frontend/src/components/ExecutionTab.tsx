@@ -394,6 +394,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
     connected: boolean
     session: any
     active_count: number
+    recent_history: any[]
   } | null>(null)
 
   useEffect(() => {
@@ -482,17 +483,28 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
         symbolSuffix,
         symbolPrefix
       )
-      const ok = res.return_code === 0
+      const accepted = res.return_code === 0
+      const mt5Queued =
+        accepted &&
+        allowLive &&
+        selectedBrokerId === 'mt5' &&
+        res.execution_route === 'mt5_bridge'
+
       const combinedOutput = [res.stdout, res.stderr].filter(Boolean).join('\n')
+
       setSubmitOutput({
-        text:
-          combinedOutput ||
-          (ok
-            ? `Ejecución del plan completada con éxito en ${selectedBroker.name}.`
-            : 'Proceso finalizado con código distinto de cero.'),
-        ok,
+        text: mt5Queued
+          ? `${combinedOutput || 'Ordenes entregadas al bridge MT5.'}\n\nPENDIENTE: esperando confirmacion final del MT5 (FILLED / REJECTED).`
+          : combinedOutput ||
+            (accepted
+              ? `Ejecucion del plan completada en ${selectedBroker.name}.`
+              : 'Proceso finalizado con codigo distinto de cero.'),
+        ok: accepted,
       })
-      if (ok) {
+
+      // En MT5 real, return_code=0 significa ENCOLADO, no FILLED.
+      // No celebrar hasta recibir confirmacion real del terminal.
+      if (accepted && !mt5Queued) {
         confetti({
           particleCount: 70,
           spread: 50,
@@ -500,6 +512,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
           colors: ['#FFFFFF', '#E8E8ED', '#86868B', '#30D158'],
         })
       }
+
       onRefresh()
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -513,6 +526,16 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
   const totalTarget = orders?.total_notional_target ?? 0
   const estimatedTotal = orders?.totals?.estimated_exposure ?? 0
   const utilization = totalTarget > 0 ? (estimatedTotal / totalTarget) * 100 : 0
+
+  const mt5History = (mt5Status?.recent_history ?? [])
+    .filter((item: any) => {
+      const historyAccount = String(item.account || item.account_id || '')
+      const currentAccount = String(mt5Status?.session?.account || '')
+      return !currentAccount || historyAccount === currentAccount
+    })
+    .slice()
+    .reverse()
+
 
   return (
     <div className="w-full space-y-12 font-sans pb-16">
@@ -805,6 +828,85 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
                   >
                     {useOpenTerminal ? 'Cambiar a credenciales manuales' : 'Cambiar a detección automática'}
                   </button>
+                </div>
+
+                {/* MT5 FINAL EXECUTION RESULTS */}
+                <div className="pt-3 border-t border-white/[0.06]">
+                  <div className="flex items-center justify-between mb-3">
+                    <div>
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-[#A1A1A6]">
+                        Resultados MT5
+                      </div>
+                      <div className="text-[10px] text-[#636366] mt-0.5">
+                        Confirmaciones finales recibidas directamente del bridge
+                      </div>
+                    </div>
+
+                    <span className="font-mono text-[9px] text-[#636366]">
+                      {mt5History.length} ACK
+                    </span>
+                  </div>
+
+                  {mt5History.length === 0 ? (
+                    <div className="rounded-xl border border-white/[0.06] bg-black/30 px-4 py-3 font-mono text-[10px] text-[#636366]">
+                      Sin ejecuciones confirmadas todavia.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {mt5History.map((item: any, idx: number) => {
+                        const status = String(item.status || 'UNKNOWN').toUpperCase()
+                        const filled = status === 'FILLED'
+                        const symbol = item.symbol || item.instrument || '---'
+                        const ticket = Number(item.ticket || 0)
+                        const price = Number(item.price || item.fill_price || 0)
+                        const notes = String(item.notes || '')
+                        const timestamp = item.timestamp
+                          ? new Date(item.timestamp).toLocaleTimeString()
+                          : ''
+
+                        return (
+                          <div
+                            key={`${item.order_id || idx}-${item.timestamp || idx}`}
+                            className="rounded-xl border border-white/[0.07] bg-black/35 px-4 py-3"
+                          >
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                              <div className="flex items-center gap-3">
+                                <span
+                                  className={cn(
+                                    'font-mono text-[9px] font-bold px-2 py-1 rounded-md border',
+                                    filled
+                                      ? 'text-[#30D158] bg-[#30D158]/10 border-[#30D158]/30'
+                                      : 'text-[#FF453A] bg-[#FF453A]/10 border-[#FF453A]/30'
+                                  )}
+                                >
+                                  {status}
+                                </span>
+
+                                <span className="font-mono text-xs font-bold text-white">
+                                  {symbol}
+                                </span>
+                              </div>
+
+                              <div className="font-mono text-[9px] text-[#636366]">
+                                {timestamp}
+                              </div>
+                            </div>
+
+                            <div className="mt-2 font-mono text-[10px] text-[#86868B] leading-relaxed">
+                              {filled ? (
+                                <>
+                                  Ticket #{ticket || '---'}
+                                  {price > 0 ? ` ? Precio ${price}` : ''}
+                                </>
+                              ) : (
+                                notes || 'Orden rechazada por el bridge MT5.'
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

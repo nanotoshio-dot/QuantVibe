@@ -1,3 +1,4 @@
+import math
 #!/usr/bin/env python3
 """
 QuantVibe Local MetaTrader 5 Bridge
@@ -191,15 +192,15 @@ def record_filled_execution(
 def main():
     args = parse_args()
     print("=" * 65)
-    print("   QUANTVIBE INSTITUTIONAL ENGINE · MT5 LOCAL DESKTOP BRIDGE")
-    print("   https://quantvibeapp.com/ · Conexión Nativa MetaTrader 5")
+    print("   QUANTVIBE INSTITUTIONAL ENGINE Â· MT5 LOCAL DESKTOP BRIDGE")
+    print("   https://quantvibeapp.com/ Â· ConexiÃ³n Nativa MetaTrader 5")
     print("=" * 65)
 
     try:
         import MetaTrader5 as mt5
     except ImportError:
-        print("[ERROR] El paquete MetaTrader5 no está instalado en este Python.")
-        print("        Instálalo ejecutando: pip install MetaTrader5")
+        print("[ERROR] El paquete MetaTrader5 no estÃ¡ instalado en este Python.")
+        print("        InstÃ¡lalo ejecutando: pip install MetaTrader5")
         sys.exit(1)
 
     # Fail-closed MT5 identity binding
@@ -271,19 +272,19 @@ def main():
         mt5.shutdown()
         sys.exit(1)
 
-    print("[2/3] Conexión MT5 Establecida:")
-    print(f"      • Cuenta Login : {account_info.login} ({account_info.currency})")
-    print(f"      • Broker / Firm: {account_info.company}")
-    print(f"      • Servidor MT5 : {account_info.server}")
+    print("[2/3] ConexiÃ³n MT5 Establecida:")
+    print(f"      â€¢ Cuenta Login : {account_info.login} ({account_info.currency})")
+    print(f"      â€¢ Broker / Firm: {account_info.company}")
+    print(f"      â€¢ Servidor MT5 : {account_info.server}")
     initial_currency = str(account_info.currency or "USD").upper()
     initial_cent_divider = 100.0 if initial_currency == "USC" else 1.0
     print(f"      Balance Real : {account_info.balance:,.2f} {initial_currency} (equiv. ${account_info.balance / initial_cent_divider:,.2f} USD)")
     print(f"      Equidad Libre: {account_info.equity:,.2f} {initial_currency} (equiv. ${account_info.equity / initial_cent_divider:,.2f} USD)")
-    print(f"      • Apalancamiento: 1:{account_info.leverage}")
-    print(f"      • Algo Trading : {'ACTIVO (Permitido)' if terminal_info.trade_allowed else 'DESACTIVADO (Activa el botón Algo Trading en MT5)'}")
+    print(f"      â€¢ Apalancamiento: 1:{account_info.leverage}")
+    print(f"      â€¢ Algo Trading : {'ACTIVO (Permitido)' if terminal_info.trade_allowed else 'DESACTIVADO (Activa el botÃ³n Algo Trading en MT5)'}")
 
     print(f"\n[3/3] Enlazando con QuantVibe Cloud Server: {args.server}")
-    print("      Escuchando órdenes institucionales en tiempo real... (Ctrl+C para salir)\n")
+    print("      Escuchando Ã³rdenes institucionales en tiempo real... (Ctrl+C para salir)\n")
 
     last_heartbeat = 0
     poll_count = 0
@@ -383,14 +384,14 @@ def main():
                 continue
 
             # 2. Poll for pending orders
-            poll_url = f"{args.server}/api/mt5/orders?account={account_id}&balance={balance}"
+            poll_url = f"{args.server}/api/mt5/orders?account={account_id}&balance={balance}&consumer=python-bridge-v1"
             poll_req = urllib.request.Request(poll_url, headers={"User-Agent": "QuantVibe-Bridge-Python/2.0"})
             with urllib.request.urlopen(poll_req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
             orders = data.get("orders", [])
             if orders:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Recibidas {len(orders)} órdenes desde QuantVibe!")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Recibidas {len(orders)} Ã³rdenes desde QuantVibe!")
 
                 for ord_item in orders:
                     order_id = ord_item.get("id") or ord_item.get("order_id")
@@ -470,9 +471,12 @@ def main():
                     est_price = float(ord_item.get("est_price", 0.0))
 
                     # Resolve symbol
-                    broker_sym = resolve_symbol(mt5, base_sym, args.prefix, args.suffix)
+                    broker_sym = (
+                        str(ord_item.get("broker_symbol") or "").strip()
+                        or resolve_symbol(mt5, base_sym, args.prefix, args.suffix)
+                    )
                     if not broker_sym:
-                        err_msg = f"Símbolo '{base_sym}' no encontrado en broker MT5. Revisa prefijo/sufijo."
+                        err_msg = f"SÃ­mbolo '{base_sym}' no encontrado en broker MT5. Revisa prefijo/sufijo."
                         print(f"  [RECHAZO] {err_msg}")
                         send_ack(args.server, order_id, account_id, base_sym, "REJECTED", 0, 0, err_msg)
                         continue
@@ -607,9 +611,11 @@ def main():
 
                     tick_age = time.time() - tick_epoch
 
+                    max_future_skew = 5.0
+
                     if (
                         not math.isfinite(tick_age)
-                        or tick_age < -5.0
+                        or tick_age < -max_future_skew
                         or tick_age > args.max_tick_age
                     ):
                         err_msg = (
@@ -663,12 +669,107 @@ def main():
                         )
                         continue
 
+                    # =========================================================
+                    # LIVE RISK PROTECTION - SL / TP REQUIRED
+                    # =========================================================
+
+                    stop_loss_raw = ord_item.get("stop_loss")
+                    take_profit_raw = ord_item.get("take_profit")
+
+                    if stop_loss_raw is None or take_profit_raw is None:
+                        err_msg = (
+                            "Orden MT5 live rechazada: faltan stop_loss y/o "
+                            "take_profit. QuantVibe no ejecuta operaciones "
+                            "reales sin proteccion."
+                        )
+                        print(f"  [RECHAZO RIESGO] {broker_sym}: {err_msg}")
+                        send_ack(
+                            args.server,
+                            order_id,
+                            account_id,
+                            broker_sym,
+                            "REJECTED",
+                            0,
+                            0,
+                            err_msg,
+                        )
+                        continue
+
+                    try:
+                        stop_loss = float(stop_loss_raw)
+                        take_profit = float(take_profit_raw)
+                    except (TypeError, ValueError):
+                        err_msg = (
+                            f"SL/TP invalidos: "
+                            f"SL={stop_loss_raw!r}, TP={take_profit_raw!r}"
+                        )
+                        print(f"  [RECHAZO RIESGO] {broker_sym}: {err_msg}")
+                        send_ack(
+                            args.server,
+                            order_id,
+                            account_id,
+                            broker_sym,
+                            "REJECTED",
+                            0,
+                            0,
+                            err_msg,
+                        )
+                        continue
+
+                    if (
+                        not math.isfinite(stop_loss)
+                        or not math.isfinite(take_profit)
+                        or stop_loss <= 0
+                        or take_profit <= 0
+                    ):
+                        err_msg = (
+                            f"SL/TP deben ser precios positivos y validos: "
+                            f"SL={stop_loss}, TP={take_profit}"
+                        )
+                        print(f"  [RECHAZO RIESGO] {broker_sym}: {err_msg}")
+                        send_ack(
+                            args.server,
+                            order_id,
+                            account_id,
+                            broker_sym,
+                            "REJECTED",
+                            0,
+                            0,
+                            err_msg,
+                        )
+                        continue
+
+                    if action == "BUY":
+                        protection_ok = stop_loss < price < take_profit
+                    else:
+                        protection_ok = take_profit < price < stop_loss
+
+                    if not protection_ok:
+                        err_msg = (
+                            f"SL/TP incoherentes para {action}: "
+                            f"SL={stop_loss}, precio={price}, TP={take_profit}"
+                        )
+                        print(f"  [RECHAZO RIESGO] {broker_sym}: {err_msg}")
+                        send_ack(
+                            args.server,
+                            order_id,
+                            account_id,
+                            broker_sym,
+                            "REJECTED",
+                            0,
+                            0,
+                            err_msg,
+                        )
+                        continue
+
                     request = {
                         "action": mt5.TRADE_ACTION_DEAL,
                         "symbol": broker_sym,
                         "volume": final_vol,
                         "type": order_type,
                         "price": price,
+                        "sl": stop_loss,
+                        "tp": take_profit,
                         "deviation": 10,
                         "magic": args.magic,
                         "comment": "QuantVibe Alpha158",
@@ -762,7 +863,7 @@ def main():
 
             poll_count += 1
             if poll_count % 20 == 0:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Puente activo · Sincronizado con MT5 ({account_info.company}) · Balance: ${balance:,.2f}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Puente activo Â· Sincronizado con MT5 ({account_info.company}) Â· Balance: ${balance:,.2f}")
 
         except urllib.error.URLError as exc:
             print(
@@ -778,7 +879,7 @@ def main():
         time.sleep(args.interval)
 
     mt5.shutdown()
-    print("[QuantVibe] Conexión cerrada.")
+    print("[QuantVibe] ConexiÃ³n cerrada.")
 
 
 

@@ -804,6 +804,21 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                     # execute only the broker's minimum valid lot.
                     remaining_margin_raw -= required_margin_raw
 
+                    # Initial MT5 protection policy.
+                    stop_pct = 0.02
+                    take_pct = 0.04
+
+                    if action == "BUY":
+                        stop_loss = price * (1.0 - stop_pct)
+                        take_profit = price * (1.0 + take_pct)
+                    else:
+                        stop_loss = price * (1.0 + stop_pct)
+                        take_profit = price * (1.0 - take_pct)
+
+                    digits = int(info.digits)
+                    stop_loss = round(stop_loss, digits)
+                    take_profit = round(take_profit, digits)
+
                     order.update(
                         status="PLANNED",
                         broker_symbol=broker_symbol,
@@ -821,6 +836,8 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                             required_margin_economic, 4
                         ),
                         est_price=round(price, 4),
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
                         est_notional=round(
                             min_lot * contract * price,
                             2,
@@ -971,8 +988,13 @@ def mt5_status(account: Optional[str] = None):
 
 
 @app.get("/api/mt5/orders")
-def get_mt5_pending_orders(account: str, balance: Optional[float] = None):
+def get_mt5_pending_orders(account: str, balance: Optional[float] = None, consumer: Optional[str] = None):
     """Returns pending MT5 orders for one explicit account only."""
+    if consumer != "python-bridge-v1":
+        raise HTTPException(
+            status_code=403,
+            detail="MT5 queue reserved for authorized Python bridge.",
+        )
     import time
 
     account = str(account or "").strip()
@@ -999,10 +1021,9 @@ def get_mt5_pending_orders(account: str, balance: Optional[float] = None):
             "last_seen_iso": datetime.now(timezone.utc).isoformat(),
         }
 
+    # Orders remain pending until the MT5 bridge acknowledges them.
+    # GET must never consume the queue by itself.
     orders = list(mt5_bridge_state["queues"].get(account, []))
-
-    # Consume only this account's queue.
-    mt5_bridge_state["queues"][account] = []
 
     return {"orders": orders}
 
@@ -1014,6 +1035,28 @@ def ack_mt5_order(payload: Dict[str, Any]):
     mt5_bridge_state["history"].append(payload)
     if len(mt5_bridge_state["history"]) > 100:
         mt5_bridge_state["history"].pop(0)
+
+    # Remove an order only after the MT5 bridge sends an ACK.
+    account_id = str(
+        payload.get("account")
+        or payload.get("account_id")
+        or ""
+    ).strip()
+
+    order_id = str(
+        payload.get("order_id")
+        or payload.get("id")
+        or ""
+    ).strip()
+
+    if account_id and order_id:
+        pending = mt5_bridge_state["queues"].get(account_id, [])
+        mt5_bridge_state["queues"][account_id] = [
+            item
+            for item in pending
+            if str(item.get("id") or item.get("order_id") or "").strip() != order_id
+        ]
+
     return {"ok": True, "received": payload.get("ticket")}
 
 
@@ -1317,7 +1360,17 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
                 )
 
             # One route only: exact-account bridge queue.
-            mt5_bridge_state["queues"][account_id] = list(planned_orders)
+            # Every queued order must have a unique identifier so the bridge
+            # can journal it, ACK it, and prevent duplicate execution.
+            import uuid
+
+            queued_orders = []
+            for order in planned_orders:
+                queued = dict(order)
+                queued["order_id"] = str(uuid.uuid4())
+                queued_orders.append(queued)
+
+            mt5_bridge_state["queues"][account_id] = queued_orders
 
             bridge_notice = (
                 f"[PUENTE MT5 ACTIVO] {len(planned_orders)} ?rdenes en cola para "
