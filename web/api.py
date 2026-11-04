@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -29,6 +30,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from bridge.signal_store import checksum_of, load_signals
+from scripts.mt5_risk_policy import (
+    build_budget,
+    max_volume_for_stop_risk,
+    summarize_budget,
+    validate_policy,
+)
+from scripts.mt5_symbol_resolver import resolve_mt5_symbol
 from vibe_side.execute_signals import build_plan
 
 app = FastAPI(
@@ -49,6 +57,21 @@ app.add_middleware(
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
+MT5_MULTI_ASSET_RISK_POLICY = CONFIG_DIR / "mt5_multiasset_risk.json"
+
+
+def _load_mt5_multiasset_risk_policy() -> Dict[str, Any]:
+    """Read the local, fail-closed MT5 risk policy used by the lot adapter."""
+    try:
+        with open(MT5_MULTI_ASSET_RISK_POLICY, "r", encoding="utf-8") as fh:
+            policy = json.load(fh)
+        validate_policy(policy)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Politica de risco MT5 indisponivel ou invalida: {exc}",
+        ) from exc
+    return policy
 
 # Global pipeline runner state
 pipeline_state = {
@@ -162,12 +185,83 @@ def is_safe_webhook_url(url_str: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-# Live in-memory registry for MT5 Expert Advisors and Local Desktop Bridges
+# A bridge must report this often enough that a stopped terminal cannot be
+# mistaken for a live one.  These are deliberately independent TTLs: a
+# heartbeat alone is not sufficient if it did not include a current terminal
+# data read.
+MT5_HEARTBEAT_TTL_SECONDS = int(os.environ.get("QV_MT5_HEARTBEAT_TTL_SECONDS", "15"))
+MT5_DATA_READ_TTL_SECONDS = int(os.environ.get("QV_MT5_DATA_READ_TTL_SECONDS", "15"))
+mt5_logger = logging.getLogger("quantvibe.mt5")
+
+
+def _mt5_log(event: str, **fields: Any) -> None:
+    """Emit machine-readable MT5 integration events without leaking secrets."""
+    mt5_logger.info(json.dumps({"event": event, "component": "mt5_integration", **fields}, default=str))
+
+
+# The only source of truth for whether an MT5 integration is live.  It is
+# intentionally in memory: after a backend restart no old terminal state can
+# be restored as CONNECTED. Queues/history are not connection state.
+mt5_integration_state: Dict[str, Dict[str, Any]] = {}
+
+# Delivery state only; it must never be used to infer MT5 availability.
 mt5_bridge_state: Dict[str, Any] = {
-    "sessions": {},   # account -> { account, broker, server, currency, balance, equity, leverage, last_seen, last_seen_iso }
     "queues": {},     # account -> list of pending order dicts
     "history": []     # execution acknowledgments from MT5 terminal
 }
+
+
+def _mt5_unavailable_detail(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "code": "MT5_INTEGRATION_UNAVAILABLE",
+        "reason": record.get("lastError") or "MT5 heartbeat or data read is not current.",
+        "lastSuccessfulHeartbeatAt": record.get("lastSuccessfulHeartbeatAt"),
+        "lastSuccessfulDataReadAt": record.get("lastSuccessfulDataReadAt"),
+        "dataSource": record.get("dataSource", "unavailable"),
+        "isLive": False,
+    }
+
+
+def _mt5_status_for(account: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve expiry at read time; cached state can never remain CONNECTED."""
+    import time
+    requested = str(account).strip() if account else ""
+    record = mt5_integration_state.get(requested) if requested else None
+    if record is None and not requested and mt5_integration_state:
+        record = max(mt5_integration_state.values(), key=lambda item: item.get("_heartbeatAt", 0))
+    if record is None:
+        return {
+            "status": "UNKNOWN", "lastSuccessfulHeartbeatAt": None,
+            "lastSuccessfulDataReadAt": None, "lastError": "No MT5 bridge has been validated since backend startup.",
+            "dataSource": "unavailable", "isLive": False, "session": None,
+        }
+
+    # A rejected heartbeat is already an explicit degraded result; it has no
+    # successful timestamps to expire and must not be relabelled CONNECTED.
+    if record.get("status") == "DEGRADED" and not record.get("_heartbeatAt"):
+        return record
+
+    now = time.time()
+    heartbeat_age = now - record.get("_heartbeatAt", 0)
+    read_age = now - record.get("_dataReadAt", 0)
+    if heartbeat_age > MT5_HEARTBEAT_TTL_SECONDS or read_age > MT5_DATA_READ_TTL_SECONDS:
+        if record.get("status") != "DISCONNECTED":
+            record["status"] = "DISCONNECTED"
+            record["isLive"] = False
+            record["dataSource"] = "unavailable"
+            record["lastError"] = (
+                f"MT5 heartbeat/data read expired (heartbeat={heartbeat_age:.1f}s, data={read_age:.1f}s)."
+            )
+            _mt5_log("connection_down", account=record.get("account"), reason=record["lastError"])
+    return record
+
+
+def _require_live_mt5(account: str) -> Dict[str, Any]:
+    record = _mt5_status_for(account)
+    if record.get("status") != "CONNECTED" or not record.get("isLive"):
+        _mt5_log("response", account=account, source="unavailable", status=record.get("status"))
+        raise HTTPException(status_code=503, detail=_mt5_unavailable_detail(record))
+    return record
 
 
 def broadcast_log(line: str):
@@ -633,6 +727,14 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                 # Vantage CENT account:
                 # 3792.91 USC == approximately 37.9291 USD economic value.
                 cent_divider = 100.0 if currency == "USC" else 1.0
+                risk_policy = _load_mt5_multiasset_risk_policy()
+                risk_budget = build_budget(
+                    float(account.balance or 0.0),
+                    currency,
+                    risk_policy["capital_allocation_pct"],
+                    int(risk_policy["max_active_assets"]),
+                    risk_policy["risk_per_trade_pct_of_asset_budget"],
+                )
 
                 margin_free_raw = float(account.margin_free or 0.0)
                 margin_free_economic = margin_free_raw / cent_divider
@@ -654,13 +756,16 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                         ),
                     )
 
-                margin_budget_raw = requested_capital * cent_divider
+                # The operator may enter the full account capital in the UI,
+                # but only the policy allocation (70%) is usable by this bot.
+                # All raw values remain in the native MT5 currency (USC here).
+                margin_budget_raw = float(risk_budget.allocated_raw)
                 remaining_margin_raw = min(
                     margin_budget_raw,
                     margin_free_raw,
                 )
 
-                symbol_map = {
+                symbol_aliases = {
                     "AAPL": "AAPL",
                     "MSFT": "MSFT",
                     "GOOGL": "GOOGL.24H",
@@ -681,14 +786,21 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                         order.get("instrument", "")
                     ).upper().strip()
 
-                    broker_symbol = symbol_map.get(instrument)
+                    requested_symbol = symbol_aliases.get(instrument, instrument)
+                    broker_symbol = resolve_mt5_symbol(
+                        mt5,
+                        requested_symbol,
+                        prefix=prefix,
+                        suffix=suffix,
+                        cent_account=cent_divider == 100.0,
+                    )
 
                     if not broker_symbol:
                         order.update(
                             status="SKIPPED",
                             qty=0,
                             quantity_unit="lots",
-                            reason="mt5_symbol_mapping_missing",
+                            reason="mt5_symbol_not_found_in_terminal",
                         )
                         continue
 
@@ -739,71 +851,6 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                         )
                         continue
 
-                    min_lot = float(info.volume_min)
-                    max_lot = float(info.volume_max)
-                    step = float(info.volume_step)
-                    contract = float(info.trade_contract_size)
-
-                    order_type = (
-                        mt5.ORDER_TYPE_BUY
-                        if action == "BUY"
-                        else mt5.ORDER_TYPE_SELL
-                    )
-
-                    required_margin_raw = mt5.order_calc_margin(
-                        order_type,
-                        broker_symbol,
-                        min_lot,
-                        price,
-                    )
-
-                    if required_margin_raw is None:
-                        order.update(
-                            status="SKIPPED",
-                            qty=0,
-                            broker_symbol=broker_symbol,
-                            quantity_unit="lots",
-                            reason="mt5_margin_calculation_failed",
-                        )
-                        continue
-
-                    required_margin_raw = float(
-                        required_margin_raw
-                    )
-
-                    required_margin_economic = (
-                        required_margin_raw / cent_divider
-                    )
-
-                    if (
-                        required_margin_raw
-                        > remaining_margin_raw + 1e-9
-                    ):
-                        order.update(
-                            status="SKIPPED",
-                            qty=0,
-                            broker_symbol=broker_symbol,
-                            quantity_unit="lots",
-                            mt5_contract_size=contract,
-                            mt5_volume_min=min_lot,
-                            mt5_volume_step=step,
-                            mt5_volume_max=max_lot,
-                            mt5_margin_required=round(
-                                required_margin_raw, 2
-                            ),
-                            mt5_margin_required_economic=round(
-                                required_margin_economic, 4
-                            ),
-                            reason=(
-                                "insufficient_mt5_margin_for_min_lot"
-                            ),
-                        )
-                        continue
-
-                    # Conservative first implementation:
-                    # execute only the broker's minimum valid lot.
-                    remaining_margin_raw -= required_margin_raw
-
                     # Initial MT5 protection policy.
                     stop_pct = 0.02
                     take_pct = 0.04
@@ -819,10 +866,92 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                     stop_loss = round(stop_loss, digits)
                     take_profit = round(take_profit, digits)
 
+                    min_lot = float(info.volume_min)
+                    max_lot = float(info.volume_max)
+                    step = float(info.volume_step)
+                    contract = float(info.trade_contract_size)
+                    order_type = (
+                        mt5.ORDER_TYPE_BUY
+                        if action == "BUY"
+                        else mt5.ORDER_TYPE_SELL
+                    )
+
+                    # MT5 supplies the instrument-specific P/L conversion.
+                    # That is required for forex, metals and CFD symbols; a
+                    # fixed percentage of notional is not a valid risk measure.
+                    one_lot_pnl_raw = mt5.order_calc_profit(
+                        order_type,
+                        broker_symbol,
+                        1.0,
+                        price,
+                        stop_loss,
+                    )
+                    if one_lot_pnl_raw is None or float(one_lot_pnl_raw) >= 0:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            reason="mt5_stop_risk_calculation_failed",
+                        )
+                        continue
+
+                    loss_at_one_lot_raw = abs(float(one_lot_pnl_raw))
+                    volume = max_volume_for_stop_risk(
+                        float(risk_budget.risk_per_trade_raw),
+                        loss_at_one_lot_raw,
+                        min_lot,
+                        max_lot,
+                        step,
+                    )
+                    if volume is None:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            mt5_loss_at_one_lot=round(loss_at_one_lot_raw, 4),
+                            mt5_risk_budget_raw=round(float(risk_budget.risk_per_trade_raw), 4),
+                            reason="risk_budget_below_mt5_min_lot",
+                        )
+                        continue
+
+                    required_margin_raw = mt5.order_calc_margin(
+                        order_type,
+                        broker_symbol,
+                        volume,
+                        price,
+                    )
+                    if required_margin_raw is None:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            reason="mt5_margin_calculation_failed",
+                        )
+                        continue
+
+                    required_margin_raw = float(required_margin_raw)
+                    required_margin_economic = required_margin_raw / cent_divider
+                    if required_margin_raw > remaining_margin_raw + 1e-9:
+                        order.update(
+                            status="SKIPPED",
+                            qty=0,
+                            broker_symbol=broker_symbol,
+                            quantity_unit="lots",
+                            mt5_margin_required=round(required_margin_raw, 2),
+                            mt5_margin_required_economic=round(required_margin_economic, 4),
+                            reason="insufficient_mt5_margin_for_policy_budget",
+                        )
+                        continue
+
+                    remaining_margin_raw -= required_margin_raw
+
                     order.update(
                         status="PLANNED",
                         broker_symbol=broker_symbol,
-                        qty=min_lot,
+                        qty=volume,
                         quantity_unit="lots",
                         source_qty_shares=order.get("qty"),
                         mt5_contract_size=contract,
@@ -835,6 +964,9 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                         mt5_margin_required_economic=round(
                             required_margin_economic, 4
                         ),
+                        mt5_loss_at_one_lot=round(loss_at_one_lot_raw, 4),
+                        mt5_max_loss_at_stop=round(volume * loss_at_one_lot_raw, 4),
+                        mt5_risk_budget_raw=round(float(risk_budget.risk_per_trade_raw), 4),
                         est_price=round(price, 4),
                         stop_loss=stop_loss,
                         take_profit=take_profit,
@@ -902,6 +1034,7 @@ def recalculate_orders_plan(req: RecalculatePlanRequest) -> Dict[str, Any]:
                         remaining_margin_raw / cent_divider,
                         4
                     ),
+                    "risk_policy": summarize_budget(risk_budget),
                 }
 
                 updated_plan[
@@ -951,39 +1084,112 @@ def download_mt5_bat():
 
 @app.post("/api/mt5/heartbeat")
 def mt5_heartbeat(payload: Dict[str, Any]):
-    """Receives live heartbeat from MT5 EA or Local Windows Desktop Bridge."""
+    """Accept a heartbeat only when it contains a fresh native MT5 read."""
     import time
-    account = str(payload.get("account") or "default")
-    payload["last_seen"] = time.time()
-    payload["last_seen_iso"] = datetime.now(timezone.utc).isoformat()
-    mt5_bridge_state["sessions"][account] = payload
-    return {"ok": True, "account": account, "status": "CONNECTED"}
+    account = str(payload.get("account") or "").strip()
+    now = time.time()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    required = ("account", "broker", "server", "currency", "balance", "equity", "leverage")
+    invalid = not account or any(payload.get(field) is None for field in required)
+    if invalid:
+        record = mt5_integration_state.setdefault(account or "unknown", {"account": account or None})
+        record.update({
+            "status": "DEGRADED", "lastSuccessfulHeartbeatAt": record.get("lastSuccessfulHeartbeatAt"),
+            "lastSuccessfulDataReadAt": record.get("lastSuccessfulDataReadAt"),
+            "lastError": "Heartbeat rejected: required current MT5 terminal fields are missing.",
+            "dataSource": "unavailable", "isLive": False, "session": None,
+        })
+        _mt5_log("heartbeat_failed", account=account or None, reason=record["lastError"])
+        raise HTTPException(status_code=503, detail=_mt5_unavailable_detail(record))
+
+    previous = mt5_integration_state.get(account, {})
+    # Keep the terminal's collection timestamp separate from the API response
+    # time. Older bridges lack it, so receipt time is explicitly the fallback.
+    collected_at = payload.get("collectedAt") or timestamp
+    session = {
+        key: payload[key]
+        for key in payload
+        if key not in {"last_seen", "last_seen_iso", "collectedAt"}
+    }
+    record = {
+        "account": account,
+        "status": "CONNECTED",
+        "lastSuccessfulHeartbeatAt": timestamp,
+        "lastSuccessfulDataReadAt": timestamp,
+        "dataCollectedAt": collected_at,
+        "lastError": None,
+        "dataSource": "live",
+        "isLive": True,
+        "session": session,
+        "_heartbeatAt": now,
+        "_dataReadAt": now,
+    }
+    mt5_integration_state[account] = record
+    _mt5_log("connection_recovered" if previous.get("status") not in (None, "CONNECTED") else "heartbeat_succeeded",
+             account=account, source="live")
+    return {"ok": True, "account": account, "status": "CONNECTED", "isLive": True}
 
 
 @app.get("/api/mt5/status")
 def mt5_status(account: Optional[str] = None):
-    """Returns live connection status of MetaTrader 5 EA or local bridge."""
-    import time
-    now = time.time()
-    active_sessions = []
-    for acc, sess in mt5_bridge_state["sessions"].items():
-        diff = now - sess.get("last_seen", 0)
-        is_active = diff < 45
-        active_sessions.append({**sess, "is_active": is_active, "seconds_ago": round(diff, 1)})
-
-    target = None
-    if account and account in mt5_bridge_state["sessions"]:
-        target = mt5_bridge_state["sessions"][account]
-    elif active_sessions:
-        active_sessions.sort(key=lambda s: s.get("last_seen", 0), reverse=True)
-        target = active_sessions[0]
-
-    connected = target is not None and (now - target.get("last_seen", 0)) < 45
+    """Status snapshot. This is safe to poll even while MT5 is unavailable."""
+    target = _mt5_status_for(account)
+    connected = target.get("status") == "CONNECTED" and target.get("isLive") is True
+    active_count = sum(
+        1 for acc in mt5_integration_state
+        if _mt5_status_for(acc).get("status") == "CONNECTED"
+    )
+    _mt5_log("response", account=account, source="live" if connected else "unavailable", status=target.get("status"))
     return {
         "connected": connected,
-        "session": target,
-        "active_count": len([s for s in active_sessions if s["is_active"]]),
-        "recent_history": mt5_bridge_state["history"][-10:]
+        "status": target.get("status"),
+        "lastSuccessfulHeartbeatAt": target.get("lastSuccessfulHeartbeatAt"),
+        "lastSuccessfulDataReadAt": target.get("lastSuccessfulDataReadAt"),
+        "dataCollectedAt": target.get("dataCollectedAt"),
+        "lastError": target.get("lastError"),
+        "dataSource": target.get("dataSource", "unavailable"),
+        "isLive": target.get("isLive", False),
+        "session": target.get("session") if connected else None,
+        "active_count": active_count,
+        # ACKs are historical execution records, never a source of live status.
+        "recent_history": [
+            {**entry, "dataSource": "historical", "isLive": False,
+             "collectedAt": entry.get("timestamp")}
+            for entry in mt5_bridge_state["history"][-10:]
+        ],
+    }
+
+
+@app.get("/api/mt5/automation-status")
+def mt5_automation_status() -> Dict[str, Any]:
+    """Read-only operational view for the MT5/Qlib shadow workflow."""
+    eligibility_path = ARTIFACTS_DIR / "mt5_model_eligibility.json"
+    history_manifest = DATA_DIR / "mt5_market" / "history" / "manifest.json"
+    risk_db = ARTIFACTS_DIR / "mt5_risk_state.sqlite3"
+    eligibility: Dict[str, Any] = {"records": []}
+    history: Dict[str, Any] = {"datasets": []}
+    try:
+        if eligibility_path.is_file():
+            eligibility = json.loads(eligibility_path.read_text(encoding="utf-8"))
+        if history_manifest.is_file():
+            history = json.loads(history_manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail=f"Estado de automatizacion no legible: {exc}") from exc
+    locks: List[Dict[str, Any]] = []
+    if risk_db.is_file():
+        try:
+            with sqlite3.connect(risk_db) as conn:
+                locks = [{"asset": row[0], "locked_until_day": row[1], "reason": row[2]} for row in conn.execute("SELECT asset,locked_until_day,reason FROM asset_locks")]
+        except sqlite3.Error as exc:
+            raise HTTPException(status_code=503, detail=f"Estado de risco nao legivel: {exc}") from exc
+    return {
+        "mode": "SHADOW",
+        "executionAuthorized": False,
+        "historyDatasets": len(history.get("datasets") or []),
+        "historyGeneratedAt": history.get("generated_utc"),
+        "eligibleModels": sum(1 for item in eligibility.get("records", []) if item.get("status") == "ELIGIBLE_FOR_RESEARCH"),
+        "blockedModels": sum(1 for item in eligibility.get("records", []) if item.get("status") == "BLOCKED"),
+        "locks": locks,
     }
 
 
@@ -995,8 +1201,6 @@ def get_mt5_pending_orders(account: str, balance: Optional[float] = None, consum
             status_code=403,
             detail="MT5 queue reserved for authorized Python bridge.",
         )
-    import time
-
     account = str(account or "").strip()
     if not account or account.lower() == "default":
         raise HTTPException(
@@ -1004,28 +1208,14 @@ def get_mt5_pending_orders(account: str, balance: Optional[float] = None, consum
             detail="MT5 polling requiere un account expl?cito; 'default' no est? permitido.",
         )
 
-    now = time.time()
-
-    if account in mt5_bridge_state["sessions"]:
-        mt5_bridge_state["sessions"][account]["last_seen"] = now
-        mt5_bridge_state["sessions"][account]["last_seen_iso"] = datetime.now(timezone.utc).isoformat()
-        if balance is not None:
-            mt5_bridge_state["sessions"][account]["balance"] = balance
-    else:
-        mt5_bridge_state["sessions"][account] = {
-            "account": account,
-            "broker": "MetaTrader 5 Client",
-            "server": "Active Terminal",
-            "balance": balance or 0.0,
-            "last_seen": now,
-            "last_seen_iso": datetime.now(timezone.utc).isoformat(),
-        }
+    _require_live_mt5(account)
 
     # Orders remain pending until the MT5 bridge acknowledges them.
     # GET must never consume the queue by itself.
     orders = list(mt5_bridge_state["queues"].get(account, []))
 
-    return {"orders": orders}
+    _mt5_log("response", account=account, source="live", endpoint="orders")
+    return {"orders": orders, "dataSource": "live", "isLive": True}
 
 
 @app.post("/api/mt5/ack")
@@ -1300,28 +1490,8 @@ def execute_orders(req: OrderSubmitRequest) -> Dict[str, Any]:
                     ),
                 )
 
-            import time
-            sess = mt5_bridge_state["sessions"].get(account_id)
-
-            if sess is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"No existe una sesi?n MT5 activa para la cuenta {account_id}. "
-                        "Inicia primero el bridge autenticado para esa cuenta."
-                    ),
-                )
-
-            age = time.time() - sess.get("last_seen", 0)
-            if age >= 45:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"La sesi?n MT5 de la cuenta {account_id} est? inactiva "
-                        f"({age:.1f}s sin heartbeat)."
-                    ),
-                )
-
+            integration = _require_live_mt5(account_id)
+            sess = integration["session"]
             session_account = str(sess.get("account", "")).strip()
             if session_account != account_id:
                 raise HTTPException(
@@ -1658,16 +1828,11 @@ def test_broker_connection(req: BrokerTestRequest) -> Dict[str, Any]:
 
     elif broker_id == "mt5":
         account = creds.get("account", "").strip() or "default"
-        now = time.time()
-        sess = mt5_bridge_state["sessions"].get(account)
-        if not sess:
-            for k, s in mt5_bridge_state["sessions"].items():
-                if now - s.get("last_seen", 0) < 60:
-                    sess = s
-                    break
+        integration = _mt5_status_for(account if account != "default" else None)
+        sess = integration.get("session")
 
-        if sess and (now - sess.get("last_seen", 0)) < 60:
-            latency_ms = round((now - sess.get("last_seen", 0)) * 8, 1) or 12.4
+        if integration.get("status") == "CONNECTED" and integration.get("isLive") and sess:
+            latency_ms = 12.4
             return {
                 "ok": True,
                 "broker_id": broker_id,
@@ -1685,16 +1850,16 @@ def test_broker_connection(req: BrokerTestRequest) -> Dict[str, Any]:
             }
         else:
             return {
-                "ok": True,
+                "ok": False,
                 "broker_id": broker_id,
                 "environment": env_mode,
-                "latency_ms": 18.2,
-                "message": "Puente MetaTrader 5 listo en el servidor. Para sincronizar tu cuenta en vivo, añade el EA QuantVibe_Bridge.mq5 a tu MT5 o ejecuta start_mt5_bridge.bat.",
+                "latency_ms": None,
+                "mt5_status": _mt5_unavailable_detail(integration),
+                "message": "MT5 desconectado: no existe heartbeat ni lectura reciente validados. Abre MT5 y arranca el bridge/EA para volver a validar la integración.",
                 "account_info": {
                     "account_id": creds.get("account") or "MT5-LOCAL-BRIDGE",
-                    "currency": "USD",
-                    "status": "AWAITING_TERMINAL_SYNC",
-                    "buying_power": "$50,000.00"
+                    "status": integration.get("status", "UNKNOWN"),
+                    "last_successful_data_read_at": integration.get("lastSuccessfulDataReadAt")
                 }
             }
 

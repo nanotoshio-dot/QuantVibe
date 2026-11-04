@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import confetti from 'canvas-confetti'
 import {
@@ -392,10 +392,21 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
   // MT5 Live Connection Status
   const [mt5Status, setMt5Status] = useState<{
     connected: boolean
+    status: 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'UNKNOWN'
+    lastSuccessfulHeartbeatAt: string | null
+    lastSuccessfulDataReadAt: string | null
+    lastError: string | null
+    dataSource: 'live' | 'cache' | 'historical' | 'unavailable'
+    isLive: boolean
     session: any
     active_count: number
     recent_history: any[]
   } | null>(null)
+  const [automationStatus, setAutomationStatus] = useState<{
+    mode: string; executionAuthorized: boolean; historyDatasets: number;
+    eligibleModels: number; blockedModels: number; locks: Array<{ asset: string; locked_until_day: string; reason: string }>
+  } | null>(null)
+  const mt5StatusRequestRef = useRef(0)
 
   useEffect(() => {
     if (orders?.total_notional_target && orders.total_notional_target > 0) {
@@ -403,18 +414,62 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
     }
   }, [orders?.total_notional_target])
 
-  // Poll MT5 heartbeat status
+  // One request at a time. Abort/counter checks prevent a late response from
+  // restoring CONNECTED after a newer failed request or tab unmount.
   useEffect(() => {
     if (selectedBrokerId !== 'mt5') return
-    const checkStatus = () => {
-      fetchMt5Status(credentials.account)
-        .then((data) => setMt5Status(data))
-        .catch(() => {})
+    let disposed = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let failures = 0
+    const requestRef = mt5StatusRequestRef
+
+    const checkStatus = async () => {
+      const requestId = ++requestRef.current
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 8000)
+      try {
+        const data = await fetchMt5Status(credentials.account, controller.signal)
+        if (!disposed && requestId === requestRef.current) {
+          failures = 0
+          setMt5Status(data)
+        }
+      } catch {
+        if (!disposed && requestId === requestRef.current) {
+          failures = Math.min(failures + 1, 4)
+          setMt5Status({
+            connected: false, status: 'UNKNOWN', lastSuccessfulHeartbeatAt: null,
+            lastSuccessfulDataReadAt: null, lastError: 'No se pudo validar el estado del bridge MT5.',
+            dataSource: 'unavailable', isLive: false, session: null, active_count: 0, recent_history: [],
+          })
+        }
+      } finally {
+        clearTimeout(timeout)
+        if (!disposed) {
+          timer = setTimeout(checkStatus, Math.min(3000 * 2 ** failures, 30000))
+        }
+      }
     }
     checkStatus()
-    const timer = setInterval(checkStatus, 3000)
-    return () => clearInterval(timer)
+    return () => {
+      disposed = true
+      ++requestRef.current
+      if (timer) clearTimeout(timer)
+    }
   }, [selectedBrokerId, credentials.account])
+
+  useEffect(() => {
+    if (selectedBrokerId !== 'mt5') return
+    let disposed = false
+    const load = async () => {
+      try {
+        const response = await fetch('/api/mt5/automation-status')
+        if (response.ok && !disposed) setAutomationStatus(await response.json())
+      } catch { /* Informational panel remains unavailable without affecting MT5 state. */ }
+    }
+    load()
+    const timer = setInterval(load, 15000)
+    return () => { disposed = true; clearInterval(timer) }
+  }, [selectedBrokerId])
 
   const handleSymbolPresetChange = (preset: string) => {
     setSymbolSyntaxPreset(preset)
@@ -458,7 +513,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
               ...credentials,
               account:
                 credentials.account?.trim() ||
-                (mt5Status?.connected && mt5Status.session?.account
+                (mt5Live && mt5Status.session?.account
                   ? String(mt5Status.session.account)
                   : ''),
             }
@@ -535,6 +590,9 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
     })
     .slice()
     .reverse()
+
+  const mt5Live = mt5Status?.status === 'CONNECTED' && mt5Status?.isLive === true && mt5Status?.dataSource === 'live'
+  const brokerTelemetryLive = selectedBroker.id === 'mt5' ? mt5Live : true
 
 
   return (
@@ -760,35 +818,35 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
               <div
                 className="rounded-2xl border p-4 sm:p-5 transition-all duration-300 space-y-3.5 backdrop-blur-xl"
                 style={{
-                  borderColor: mt5Status?.connected ? 'rgba(48, 209, 88, 0.4)' : 'rgba(255, 255, 255, 0.1)',
-                  backgroundColor: mt5Status?.connected ? 'rgba(48, 209, 88, 0.05)' : 'rgba(0, 0, 0, 0.5)',
+                  borderColor: mt5Live ? 'rgba(48, 209, 88, 0.4)' : 'rgba(255, 69, 58, 0.45)',
+                  backgroundColor: mt5Live ? 'rgba(48, 209, 88, 0.05)' : 'rgba(255, 69, 58, 0.06)',
                 }}
               >
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div className="flex items-start sm:items-center gap-3">
-                    <StatusDot tone={mt5Status?.connected ? 'pos' : 'warn'} ping={mt5Status?.connected} />
+                    <StatusDot tone={mt5Live ? 'pos' : 'warn'} ping={mt5Live} />
                     <div>
                       <div className="text-xs font-bold text-white flex flex-wrap items-center gap-2">
                         <span>
-                          {mt5Status?.connected
+                          {mt5Live
                             ? 'Terminal MetaTrader 5 Conectado en Tiempo Real'
                             : 'MetaTrader 5: En Espera de Conexión del Terminal'}
                         </span>
                         <span
                           className={cn(
                             'font-mono text-[9px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider',
-                            mt5Status?.connected
+                            mt5Live
                               ? 'bg-[#30D158]/20 text-[#30D158] border border-[#30D158]/30'
                               : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
                           )}
                         >
-                          {mt5Status?.connected ? 'LIVE IPC SYNC' : 'AWAITING LOCAL TERMINAL'}
+                          {mt5Live ? 'LIVE IPC SYNC' : 'MT5 DESCONECTADO — NO LIVE'}
                         </span>
                       </div>
                       <p className="text-[11px] text-[#86868B] mt-0.5 leading-relaxed">
-                        {mt5Status?.connected
+                        {mt5Live
                           ? `Broker: ${mt5Status.session.broker || 'MetaTrader 5'} (${mt5Status.session.server || 'Server'}) · Cuenta: ${mt5Status.session.account} · Balance: $${Number(mt5Status.session.balance || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })} ${mt5Status.session.currency || 'USD'} · Apalancamiento: 1:${mt5Status.session.leverage || 100}`
-                          : 'Para que las órdenes se ejecuten en tu MT5, descarga el Expert Advisor oficial o inicia el puente 1-clic en tu PC:'}
+                          : `MT5 desconectado — datos no son en vivo. ${mt5Status?.lastSuccessfulDataReadAt ? `Última actualización válida: ${new Date(mt5Status.lastSuccessfulDataReadAt).toLocaleString()}.` : 'No hay lectura válida desde el inicio del backend.'}`}
                       </p>
                     </div>
                   </div>
@@ -828,6 +886,18 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
                   >
                     {useOpenTerminal ? 'Cambiar a credenciales manuales' : 'Cambiar a detección automática'}
                   </button>
+                </div>
+
+                <div className="rounded-xl border border-white/[0.06] bg-black/20 px-3 py-2.5 text-[10px] font-mono">
+                  <div className="flex items-center justify-between text-[#A1A1A6]">
+                    <span>AUTOMATIZACIÃ“N MT5 / QLIB</span>
+                    <span className="text-amber-400">{automationStatus?.mode || 'SHADOW'} â€” SIN ENVÃO</span>
+                  </div>
+                  <div className="mt-1.5 text-[#86868B]">
+                    {automationStatus
+                      ? `${automationStatus.historyDatasets} series de mercado Â· ${automationStatus.eligibleModels} modelos aptos Â· ${automationStatus.blockedModels} bloqueados Â· ${automationStatus.locks.length} activos con stop-lock.`
+                      : 'Cargando estado de datos, modelos y bloqueosâ€¦'}
+                  </div>
                 </div>
 
                 {/* MT5 FINAL EXECUTION RESULTS */}
@@ -954,9 +1024,12 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
                 <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-[#86868B]">
                   Telemetría del Enlace
                 </span>
-                <span className="flex items-center gap-1.5 font-mono text-[10px] text-[#30D158]">
-                  <StatusDot tone="pos" ping={isTestingPing} />
-                  {isTestingPing ? 'Midiendo Latencia…' : 'Enlace Listo'}
+                <span className={cn(
+                  'flex items-center gap-1.5 font-mono text-[10px]',
+                  brokerTelemetryLive ? 'text-[#30D158]' : 'text-[#FF453A]'
+                )}>
+                  <StatusDot tone={brokerTelemetryLive ? 'pos' : 'neg'} ping={isTestingPing && brokerTelemetryLive} />
+                  {isTestingPing ? 'Midiendo Latencia…' : brokerTelemetryLive ? 'Enlace Validado' : 'MT5 No Disponible'}
                 </span>
               </div>
 
@@ -966,12 +1039,18 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
                   <span className="text-white font-bold">{selectedBroker.name}</span>
                 </div>
                 <div className="flex items-center justify-between border-b border-white/[0.05] pb-2.5">
-                  <span className="text-[#86868B]">Latencia Estimada:</span>
-                  <span className="text-[#30D158] font-bold">{selectedBroker.latency_ms} ms</span>
+                  <span className="text-[#86868B]">Latencia:</span>
+                  <span className={cn('font-bold', brokerTelemetryLive ? 'text-[#30D158]' : 'text-[#FF453A]')}>
+                    {selectedBroker.id === 'mt5' && !mt5Live ? 'No validada' : `${selectedBroker.latency_ms} ms`}
+                  </span>
                 </div>
                 <div className="flex items-center justify-between border-b border-white/[0.05] pb-2.5">
                   <span className="text-[#86868B]">Entorno:</span>
-                  <span className="text-white font-bold">{allowLive ? 'MERCADO REAL' : 'CUENTA SOMBRA'}</span>
+                  <span className="text-white font-bold">
+                    {selectedBroker.id === 'mt5' && !mt5Live
+                      ? 'INTEGRACIÓN NO DISPONIBLE'
+                      : allowLive ? 'MERCADO REAL' : 'CUENTA SOMBRA'}
+                  </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-[#86868B]">Firma del Lote:</span>
@@ -1416,7 +1495,19 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
                 </tr>
               </thead>
               <tbody>
-                {orderList.map((ord, idx) => {
+                {orderList.map((rawOrder, idx) => {
+                  const missingNumber: any = {
+                    valueOf: () => 0,
+                    toString: () => '—',
+                    toFixed: () => '—',
+                    toLocaleString: () => '—',
+                  }
+                  const ord: any = {
+                    ...rawOrder,
+                    qty: Number.isFinite(Number(rawOrder.qty)) ? Number(rawOrder.qty) : missingNumber,
+                    est_price: Number.isFinite(Number(rawOrder.est_price)) ? Number(rawOrder.est_price) : missingNumber,
+                    est_notional: Number.isFinite(Number(rawOrder.est_notional)) ? Number(rawOrder.est_notional) : missingNumber,
+                  }
                   const displaySymbol = ord.broker_symbol || (
                     symbolSuffix || symbolPrefix
                       ? `${symbolPrefix}${ord.instrument}${symbolSuffix}`
@@ -1467,7 +1558,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
             <Lock className="h-4 w-4 text-[#30D158]" />
             <span>
               Destino: <strong className="text-white">{selectedBroker.name}</strong>
-              {selectedBroker.id === 'mt5' && mt5Status?.connected && (
+              {selectedBroker.id === 'mt5' && mt5Live && (
                 <span className="ml-2 text-[#30D158] font-bold">
                   (● Enlace Activo: {mt5Status.session.broker || 'MT5 Terminal'})
                 </span>
@@ -1479,7 +1570,7 @@ export const ExecutionTab: React.FC<ExecutionTabProps> = ({ orders, onRefresh })
             variant={allowLive ? 'danger' : 'primary'}
             size="lg"
             loading={isSubmitting}
-            disabled={isSubmitting || !orderList.some((o) => o.status === 'PLANNED')}
+            disabled={isSubmitting || !orderList.some((o) => o.status === 'PLANNED') || (allowLive && selectedBroker.id === 'mt5' && !mt5Live)}
             onClick={() => (allowLive ? setShowConfirmModal(true) : handleExecute())}
           >
             {!isSubmitting && <Send className="h-4 w-4" />}

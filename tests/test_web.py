@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 try:
     from starlette.testclient import TestClient
-    from web.api import app
+    from web.api import app, mt5_bridge_state, mt5_integration_state
     HAS_WEB_DEPS = True
 except ImportError:
     HAS_WEB_DEPS = False
@@ -15,10 +15,13 @@ except ImportError:
 class TestWebAPI(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
+        mt5_integration_state.clear()
+        mt5_bridge_state["queues"].clear()
+        mt5_bridge_state["history"].clear()
 
     def test_status_endpoint(self):
         res = self.client.get("/api/status")
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 200, res.text)
         data = res.json()
         self.assertIn("artifacts", data)
         self.assertIn("pipeline", data)
@@ -90,6 +93,74 @@ class TestWebAPI(unittest.TestCase):
         res_ack = self.client.post("/api/mt5/ack", json=ack_payload)
         self.assertEqual(res_ack.status_code, 200)
 
+    def test_mt5_closed_never_reports_live_or_serves_orders(self):
+        """A backend/browser refresh starts UNKNOWN, never from an old cache."""
+        status = self.client.get("/api/mt5/status?account=closed-account")
+        self.assertEqual(status.status_code, 200)
+        body = status.json()
+        self.assertEqual(body["status"], "UNKNOWN")
+        self.assertFalse(body["connected"])
+        self.assertFalse(body["isLive"])
+        self.assertEqual(body["dataSource"], "unavailable")
+
+        orders = self.client.get("/api/mt5/orders?account=closed-account&consumer=python-bridge-v1")
+        self.assertEqual(orders.status_code, 503)
+        detail = orders.json()["detail"]
+        self.assertEqual(detail["code"], "MT5_INTEGRATION_UNAVAILABLE")
+        self.assertFalse(detail["isLive"])
+
+        broker_test = self.client.post(
+            "/api/brokers/test",
+            json={"broker_id": "mt5", "environment": "live", "credentials": {"account": "closed-account"}},
+        )
+        self.assertEqual(broker_test.status_code, 200)
+        self.assertFalse(broker_test.json()["ok"])
+        self.assertEqual(broker_test.json()["mt5_status"]["code"], "MT5_INTEGRATION_UNAVAILABLE")
+
+    def test_expired_heartbeat_and_cache_are_not_live(self):
+        payload = {
+            "account": "expired", "broker": "Test", "server": "TestServer", "currency": "USD",
+            "balance": 100.0, "equity": 100.0, "leverage": 100,
+        }
+        self.assertEqual(self.client.post("/api/mt5/heartbeat", json=payload).status_code, 200)
+        # Simulates MT5/bridge being stopped while its old account snapshot remains in memory.
+        mt5_integration_state["expired"]["_heartbeatAt"] = 0
+        mt5_integration_state["expired"]["_dataReadAt"] = 0
+        status = self.client.get("/api/mt5/status?account=expired").json()
+        self.assertEqual(status["status"], "DISCONNECTED")
+        self.assertFalse(status["isLive"])
+        self.assertEqual(status["dataSource"], "unavailable")
+        self.assertIsNotNone(status["lastSuccessfulDataReadAt"])
+        self.assertEqual(
+            self.client.get("/api/mt5/orders?account=expired&consumer=python-bridge-v1").status_code,
+            503,
+        )
+
+    def test_reconnect_requires_a_new_validated_terminal_read(self):
+        bad = self.client.post("/api/mt5/heartbeat", json={"account": "reconnect"})
+        self.assertEqual(bad.status_code, 503)
+        self.assertEqual(self.client.get("/api/mt5/status?account=reconnect").json()["status"], "DEGRADED")
+
+        good = self.client.post("/api/mt5/heartbeat", json={
+            "account": "reconnect", "broker": "Test", "server": "TestServer", "currency": "USD",
+            "balance": 100.0, "equity": 99.0, "leverage": 100,
+        })
+        self.assertEqual(good.status_code, 200)
+        status = self.client.get("/api/mt5/status?account=reconnect").json()
+        self.assertEqual(status["status"], "CONNECTED")
+        self.assertTrue(status["isLive"])
+        self.assertEqual(status["dataSource"], "live")
+
+    def test_terminal_collection_timestamp_is_preserved(self):
+        collected_at = "2026-11-03T12:00:00+00:00"
+        heartbeat = self.client.post("/api/mt5/heartbeat", json={
+            "account": "timestamped", "broker": "Test", "server": "TestServer", "currency": "USD",
+            "balance": 100.0, "equity": 100.0, "leverage": 100, "collectedAt": collected_at,
+        })
+        self.assertEqual(heartbeat.status_code, 200)
+        status = self.client.get("/api/mt5/status?account=timestamped").json()
+        self.assertEqual(status["dataCollectedAt"], collected_at)
+
     def test_recalculate_orders_plan(self):
         res = self.client.post(
             "/api/orders/recalculate",
@@ -125,6 +196,7 @@ class TestWebAPI(unittest.TestCase):
                 volume_step=step,
                 volume_max=max_lot,
                 trade_contract_size=1.0,
+                digits=2,
             )
 
         fake_mt5 = SimpleNamespace(
@@ -137,6 +209,7 @@ class TestWebAPI(unittest.TestCase):
 
             account_info=lambda: SimpleNamespace(
                 currency="USC",
+                balance=4_462.76,
                 margin_free=1_000_000.0,
             ),
 
@@ -150,6 +223,7 @@ class TestWebAPI(unittest.TestCase):
             ),
 
             order_calc_margin=lambda order_type, symbol, lot, price: 100.0,
+            order_calc_profit=lambda order_type, symbol, lot, price_open, price_close: -100.0 * lot,
         )
 
         with patch.dict(
@@ -166,7 +240,7 @@ class TestWebAPI(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 200, res.text)
 
         data = res.json()
 
@@ -187,6 +261,12 @@ class TestWebAPI(unittest.TestCase):
         self.assertEqual(
             data["mt5_margin"]["cent_divider"],
             100.0,
+        )
+
+        self.assertAlmostEqual(
+            data["mt5_margin"]["risk_policy"]["risk_per_trade_raw"],
+            19.524575,
+            places=5,
         )
 
         orders = data.get("orders", [])

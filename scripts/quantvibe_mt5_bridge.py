@@ -12,8 +12,11 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+from mt5_symbol_resolver import normalized_tick_age, resolve_mt5_symbol
+from mt5_outcome_observer import observe_closed_deals
 
 
 def parse_args():
@@ -35,38 +38,6 @@ def parse_args():
     )
     parser.add_argument("--magic", type=int, default=202609, help="QuantVibe Magic Number")
     return parser.parse_args()
-
-
-def resolve_symbol(mt5, base_symbol: str, prefix: str = "", suffix: str = "") -> str | None:
-    # 1. Exact match
-    if mt5.symbol_info(base_symbol) is not None:
-        mt5.symbol_select(base_symbol, True)
-        return base_symbol
-
-    # 2. Custom prefix/suffix
-    custom = f"{prefix}{base_symbol}{suffix}"
-    if mt5.symbol_info(custom) is not None:
-        mt5.symbol_select(custom, True)
-        return custom
-
-    # 3. Common broker naming conventions (FTMO, IC Markets, XM, Tickmill)
-    candidates = [
-        f"{base_symbol}.US",
-        f"{base_symbol}.us",
-        f"#{base_symbol}",
-        f"{base_symbol}_CFD",
-        f"{base_symbol}.cfd",
-        f"{base_symbol}.pro",
-        f"{base_symbol}_m",
-        f"{base_symbol}.m",
-        f"{base_symbol}.cash",
-    ]
-    for cand in candidates:
-        if mt5.symbol_info(cand) is not None:
-            mt5.symbol_select(cand, True)
-            return cand
-
-    return None
 
 
 def normalize_volume(symbol_info, desired_qty: float) -> float:
@@ -343,9 +314,24 @@ def main():
             equity = equity_raw / cent_divider
             margin_free = margin_free_raw / cent_divider
 
+            # Read-only post-trade observer.  It considers only journaled
+            # QuantVibe tickets with this bridge magic; manual/other-bot
+            # trades are deliberately ignored.
+            try:
+                for outcome in observe_closed_deals(mt5, executed_orders, args.magic):
+                    print(
+                        f"[OUTCOME] {outcome['symbol']} {outcome['outcome']} "
+                        f"(order_id={outcome['order_id']})"
+                    )
+            except Exception as exc:
+                # Outcome monitoring must never be allowed to create orders;
+                # a failure is visible and leaves the execution path unchanged.
+                print(f"[OUTCOME ERROR] No se pudo observar cierres MT5: {exc}")
+
             # 1. Send Heartbeat every 10 seconds
             if now - last_heartbeat > 10:
                 heartbeat_payload = json.dumps({
+                    "collectedAt": datetime.now(timezone.utc).isoformat(),
                     "account": account_id,
                     "broker": acc.company if acc else "Unknown",
                     "server": acc.server if acc else "Unknown",
@@ -471,9 +457,13 @@ def main():
                     est_price = float(ord_item.get("est_price", 0.0))
 
                     # Resolve symbol
-                    broker_sym = (
-                        str(ord_item.get("broker_symbol") or "").strip()
-                        or resolve_symbol(mt5, base_sym, args.prefix, args.suffix)
+                    requested_symbol = str(ord_item.get("broker_symbol") or base_sym).strip()
+                    broker_sym = resolve_mt5_symbol(
+                        mt5,
+                        requested_symbol,
+                        prefix=args.prefix,
+                        suffix=args.suffix,
+                        cent_account=cent_account,
                     )
                     if not broker_sym:
                         err_msg = f"SÃ­mbolo '{base_sym}' no encontrado en broker MT5. Revisa prefijo/sufijo."
@@ -609,18 +599,17 @@ def main():
                         )
                         continue
 
-                    tick_age = time.time() - tick_epoch
+                    tick_age, timezone_offset = normalized_tick_age(
+                        tick_epoch,
+                        time.time(),
+                        max_age=args.max_tick_age,
+                    )
 
-                    max_future_skew = 5.0
-
-                    if (
-                        not math.isfinite(tick_age)
-                        or tick_age < -max_future_skew
-                        or tick_age > args.max_tick_age
-                    ):
+                    if tick_age is None:
                         err_msg = (
                             f"Tick MT5 obsoleto para {broker_sym}: "
-                            f"edad={tick_age:.1f}s, m?ximo={args.max_tick_age:.1f}s"
+                            f"edad_bruta={time.time() - tick_epoch:.1f}s, "
+                            f"m?ximo={args.max_tick_age:.1f}s"
                         )
                         print(f"  [RECHAZO] {err_msg}")
                         send_ack(
@@ -634,6 +623,13 @@ def main():
                             err_msg,
                         )
                         continue
+
+                    if timezone_offset:
+                        print(
+                            f"  [TICK CLOCK] {broker_sym}: desfase horario MT5 "
+                            f"{timezone_offset // 3600:+d}h compensado; "
+                            f"edad ajustada={tick_age:.1f}s"
+                        )
 
                     price = float(tick.ask if action == "BUY" else tick.bid)
 

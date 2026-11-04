@@ -105,14 +105,21 @@ export async function recalculateOrdersPlan(
   return res.json()
 }
 
-export async function fetchMt5Status(account?: string): Promise<{
+export async function fetchMt5Status(account?: string, signal?: AbortSignal): Promise<{
   connected: boolean
+  status: 'CONNECTED' | 'DEGRADED' | 'DISCONNECTED' | 'UNKNOWN'
+  lastSuccessfulHeartbeatAt: string | null
+  lastSuccessfulDataReadAt: string | null
+  dataCollectedAt?: string | null
+  lastError: string | null
+  dataSource: 'live' | 'cache' | 'historical' | 'unavailable'
+  isLive: boolean
   session: any
   active_count: number
   recent_history: any[]
 }> {
   const query = account ? `?account=${encodeURIComponent(account)}` : ''
-  const res = await apiFetch(`/mt5/status${query}`)
+  const res = await apiFetch(`/mt5/status${query}`, { signal })
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
   return res.json()
 }
@@ -150,5 +157,3 @@ export async function fetchFeatureAttribution(): Promise<FeatureAttributionRespo
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
   return res.json()
 }
-
-

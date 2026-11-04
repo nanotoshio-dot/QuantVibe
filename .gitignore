@@ -2,6 +2,7 @@
 venv/
 venvs/
 .venv/
+.venv.backup-*/
 env/
 __pycache__/
 *.py[cod]
@@ -86,3 +87,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Account-specific local launcher (may contain MT5 account/profile details)
+Iniciar_QuantVibe.bat

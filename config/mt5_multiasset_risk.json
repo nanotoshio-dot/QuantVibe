@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "mode": "shadow",
+  "account_currency": "USC",
+  "capital_allocation_pct": 0.7,
+  "max_active_assets": 8,
+  "risk_per_trade_pct_of_asset_budget": 0.05,
+  "one_stop_lock_scope": "asset_until_next_trading_day",
+  "single_inflight_order": true,
+  "allow_live_submission": false,
+  "assets": [
+    {"instrument": "AAPL", "asset_class": "equity_cfd", "trade_sessions": "broker_quote_required"},
+    {"instrument": "NVDA", "broker_symbol": "NVIDIA", "asset_class": "equity_cfd", "trade_sessions": "broker_quote_required"},
+    {"instrument": "JPM", "asset_class": "equity_cfd", "trade_sessions": "broker_quote_required"},
+    {"instrument": "V", "broker_symbol": "VISA", "asset_class": "equity_cfd", "trade_sessions": "broker_quote_required"},
+    {"instrument": "EURUSD", "asset_class": "forex", "trade_sessions": "forex_24_5_excluding_rollover"},
+    {"instrument": "GBPUSD", "asset_class": "forex", "trade_sessions": "forex_24_5_excluding_rollover"},
+    {"instrument": "USDJPY", "asset_class": "forex", "trade_sessions": "forex_24_5_excluding_rollover"},
+    {"instrument": "XAUUSD", "asset_class": "metal", "trade_sessions": "forex_24_5_excluding_rollover"}
+  ]
+}
