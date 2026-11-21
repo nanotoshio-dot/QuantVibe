@@ -1,10 +1,10 @@
 {
-  "source_model": "LinearModel",
-  "data_source": "qlib",
-  "rows": 4580,
-  "as_of": "2026-10-29",
+  "source_model": "DemoMomentum",
+  "data_source": "synthetic",
+  "rows": 15090,
+  "as_of": "2026-11-11",
   "test_window": [
     "2025-01-02",
-    "2026-10-30"
+    "2026-11-11"
   ]
 }

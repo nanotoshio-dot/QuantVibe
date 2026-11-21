@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-10-30T06:14:01+00:00",
-  "source_model": "LinearModel",
+  "generated_at": "2026-11-11T10:43:08+00:00",
+  "source_model": "DemoMomentum",
   "universe": [
     "AAPL",
     "AMZN",
@@ -14,44 +14,44 @@
     "V",
     "XOM"
   ],
-  "as_of": "2026-10-29",
+  "as_of": "2026-11-11",
   "horizon_days": 1,
   "signals": [
     {
-      "instrument": "V",
-      "score": 0.2235734760761261,
+      "instrument": "MSFT",
+      "score": 0.2908021972492907,
       "rank": 1
     },
     {
-      "instrument": "AMZN",
-      "score": 0.2234362959861755,
+      "instrument": "GOOGL",
+      "score": 0.1270568620614625,
       "rank": 2
     },
     {
-      "instrument": "XOM",
-      "score": 0.2231093645095825,
+      "instrument": "AAPL",
+      "score": 0.0547253284393927,
       "rank": 3
     },
     {
-      "instrument": "NVDA",
-      "score": 0.2005615532398224,
+      "instrument": "V",
+      "score": 0.0145996794542346,
       "rank": 4
     },
     {
-      "instrument": "GOOGL",
-      "score": 0.1657294183969497,
+      "instrument": "AMZN",
+      "score": -0.0276339667999592,
       "rank": 5
     }
   ],
   "metadata": {
     "top_k": 5,
     "horizon_days": 1,
-    "data_source": "qlib",
+    "data_source": "synthetic",
     "n_candidates": 5,
     "test_window": [
       "2025-01-02",
-      "2026-10-30"
+      "2026-11-11"
     ]
   },
-  "checksum": "902f8f3016527714f27c262495e79727012b022e6228f53a7b6e2c24a3308816"
+  "checksum": "f74118b12facce8e6818ee3f6d5d72b891f0d67200cfdffaf50c4c2372431b15"
 }
